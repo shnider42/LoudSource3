@@ -1,18 +1,37 @@
 #!/usr/bin/env python3
-# loud_0_26_render.py — v0.26 (Render-ready)
-from flask import Flask, request, render_template_string, redirect, url_for, session, jsonify, has_request_context
-import os, time, threading
+# app.py — Spotify vote queue, Render-ready
+#
+# Notes:
+# - This version pins playback and queue operations to the same Spotify device.
+# - It logs queue/playback failures instead of swallowing them silently.
+# - Run this app with a single worker/process on Render. It keeps queue/token/state
+#   in memory, so multiple workers will drift out of sync.
+
+from flask import (
+    Flask,
+    request,
+    render_template_string,
+    redirect,
+    url_for,
+    session,
+    jsonify,
+    has_request_context,
+)
+import os
+import time
+import threading
 from collections import defaultdict
+
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
 
 # ─── Config (env-driven for Render) ────────────────────────────────────────────
 SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID", "").strip()
 SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET", "").strip()
-# Example for Render: https://your-service.onrender.com/callback
-REDIRECT_URI = os.getenv("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:5000/callback").strip()
+SPOTIPY_REDIRECT_URI = os.getenv(
+    "SPOTIPY_REDIRECT_URI", "http://127.0.0.1:5000/callback"
+).strip()
 
-# NOTE: You must include both scopes to control playback on your account/device.
 SCOPES = "user-modify-playback-state user-read-playback-state"
 
 QUEUE_AHEAD_SECONDS = int(os.getenv("QUEUE_AHEAD_SECONDS", "10"))
@@ -25,7 +44,6 @@ START_COOLDOWN_SECONDS = float(os.getenv("START_COOLDOWN_SECONDS", "2"))
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-me")
 
-# Hardening for production (Render sets HTTPS at the edge)
 if os.getenv("RENDER", "0") == "1":
     app.config.update(
         SESSION_COOKIE_SECURE=True,
@@ -33,47 +51,58 @@ if os.getenv("RENDER", "0") == "1":
         PREFERRED_URL_SCHEME="https",
     )
 
-# Search API (client credentials: no user login required)
-sp_search = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-    client_id=SPOTIPY_CLIENT_ID,
-    client_secret=SPOTIPY_CLIENT_SECRET
-))
+# ─── Spotify clients ───────────────────────────────────────────────────────────
+sp_search = spotipy.Spotify(
+    auth_manager=SpotifyClientCredentials(
+        client_id=SPOTIPY_CLIENT_ID,
+        client_secret=SPOTIPY_CLIENT_SECRET,
+    )
+)
 
-# votes[track_id] -> int, and track cache
+# ─── In-memory state ───────────────────────────────────────────────────────────
 votes = defaultdict(int)
 tracks = {}  # track_id -> dict(name, artist, image, preview_url)
 
-# OAuth token for background thread access
 TOKEN_INFO = None
 TOKEN_LOCK = threading.Lock()
 
-# Playback state cache (from Spotify)
 STATE_LOCK = threading.Lock()
-CURRENT_URI = None                  # "spotify:track:..."
-CURRENT_DURATION_SEC = None         # int seconds
-QUEUED_NEXT_FOR_URI = None          # uri we've already queued for this CURRENT_URI (dedupe)
-AUTO_ENABLED = False                # only after "Start with top track"
-DEVICE_ID = None                    # cached device target
-COOLDOWN_UNTIL = 0.0                # unix ts; during cooldown we do nothing
-LAST_PAUSED_TS = None               # unix ts when we first noticed paused
+CURRENT_URI = None
+CURRENT_DURATION_SEC = None
+QUEUED_NEXT_FOR_URI = None
+AUTO_ENABLED = False
+
+DEVICE_ID = None
+DEVICE_NAME = None
+
+COOLDOWN_UNTIL = 0.0
+LAST_PAUSED_TS = None
+
+BG_THREAD_STARTED = False
+BG_THREAD_LOCK = threading.Lock()
+
 
 def log(msg):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
+
 # ─── OAuth helpers ─────────────────────────────────────────────────────────────
 def _oauth():
-    if not (SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET and REDIRECT_URI):
-        raise RuntimeError("Missing SPOTIPY_CLIENT_ID/SECRET or SPOTIPY_REDIRECT_URI")
+    if not (SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET and SPOTIPY_REDIRECT_URI):
+        raise RuntimeError(
+            "Missing SPOTIPY_CLIENT_ID/SECRET or SPOTIPY_REDIRECT_URI"
+        )
     return SpotifyOAuth(
         client_id=SPOTIPY_CLIENT_ID,
         client_secret=SPOTIPY_CLIENT_SECRET,
-        redirect_uri=REDIRECT_URI,
+        redirect_uri=SPOTIPY_REDIRECT_URI,
         scope=SCOPES,
         cache_handler=None,
         show_dialog=False,
         open_browser=False,
     )
+
 
 def _save_token_info(token_info):
     global TOKEN_INFO
@@ -81,12 +110,12 @@ def _save_token_info(token_info):
         TOKEN_INFO = token_info
     session["token_info"] = token_info
 
+
 def _get_token_info():
     global TOKEN_INFO
     with TOKEN_LOCK:
         ti = TOKEN_INFO
 
-    # Fall back to the signed session cookie during request handling.
     if not ti and has_request_context():
         ti = session.get("token_info")
         if ti:
@@ -96,7 +125,6 @@ def _get_token_info():
     if not ti:
         return None
 
-    # Refresh near expiry
     if ti.get("expires_at", 0) - int(time.time()) < 60:
         try:
             ti = _oauth().refresh_access_token(ti["refresh_token"])
@@ -108,7 +136,9 @@ def _get_token_info():
             TOKEN_INFO = ti
         if has_request_context():
             session["token_info"] = ti
+
     return ti
+
 
 def _user_sp():
     ti = _get_token_info()
@@ -116,27 +146,66 @@ def _user_sp():
         return None
     return spotipy.Spotify(auth=ti["access_token"])
 
+
 # ─── Devices ───────────────────────────────────────────────────────────────────
-def _pick_device(sp_user):
+def _list_devices(sp_user):
     try:
-        devices = sp_user.devices().get("devices", [])
-    except spotipy.SpotifyException:
-        return None
+        return sp_user.devices().get("devices", [])
+    except spotipy.SpotifyException as e:
+        log(f"devices() failed: {e}")
+        return []
+
+
+def _resolve_target_device(sp_user, prefer_active=False):
+    """
+    Return a device dict to target and refresh global DEVICE_ID/DEVICE_NAME.
+    If prefer_active=True, prefer the currently active device first.
+    """
+    global DEVICE_ID, DEVICE_NAME
+
+    devices = _list_devices(sp_user)
     if not devices:
         return None
-    active = next((d for d in devices if d.get("is_active")), None)
-    return active["id"] if active else devices[0]["id"]
+
+    chosen = None
+
+    if prefer_active:
+        chosen = next((d for d in devices if d.get("is_active")), None)
+
+    if not chosen and DEVICE_ID:
+        chosen = next((d for d in devices if d.get("id") == DEVICE_ID), None)
+
+    if not chosen:
+        chosen = next((d for d in devices if d.get("is_active")), None)
+
+    if not chosen:
+        chosen = devices[0]
+
+    DEVICE_ID = chosen.get("id")
+    DEVICE_NAME = chosen.get("name")
+    return chosen
+
+
+def _get_active_device(sp_user):
+    devices = _list_devices(sp_user)
+    return next((d for d in devices if d.get("is_active")), None)
+
 
 # ─── Tracks / queue helpers ────────────────────────────────────────────────────
 def _track_dict_from_sp_item(t):
     images = t.get("album", {}).get("images", [])
-    image = images[1]["url"] if len(images) > 1 else (images[0]["url"] if images else None)
+    image = (
+        images[1]["url"]
+        if len(images) > 1
+        else (images[0]["url"] if images else None)
+    )
     return {
         "name": t["name"],
         "artist": t["artists"][0]["name"],
         "image": image,
         "preview_url": t.get("preview_url"),
     }
+
 
 def _ensure_track_cached_by_tid(tid, sp_user=None):
     if tid in tracks:
@@ -145,70 +214,104 @@ def _ensure_track_cached_by_tid(tid, sp_user=None):
         sp = sp_user or _user_sp() or sp_search
         info = sp.track(tid)
         tracks[tid] = _track_dict_from_sp_item(info)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Failed to cache track {tid}: {e}")
+
 
 def _ordered_ids(exclude_tid=None):
     ordered = sorted(votes.items(), key=lambda x: x[1], reverse=True)
     return [tid for tid, cnt in ordered if cnt > 0 and tid != exclude_tid]
 
+
+def _candidate_next_uri(current_uri):
+    exclude_tid = (
+        current_uri.split(":")[-1]
+        if current_uri and current_uri.startswith("spotify:track:")
+        else None
+    )
+    ids = _ordered_ids(exclude_tid=exclude_tid)
+    return f"spotify:track:{ids[0]}" if ids else None
+
+
 def _progress_state(sp_user):
-    """Return (current_uri, progress_sec, duration_sec, is_playing) or (None,None,None,None)."""
+    """Return (current_uri, progress_sec, duration_sec, is_playing)."""
     try:
         pb = sp_user.current_playback()
-    except spotipy.SpotifyException:
+    except spotipy.SpotifyException as e:
+        log(f"current_playback() failed: {e}")
         return None, None, None, None
+
     if not pb or not pb.get("item"):
         return None, None, None, None
+
     uri = pb["item"].get("uri")
     prog_ms = pb.get("progress_ms") or 0
     dur_ms = pb["item"].get("duration_ms") or 0
     is_playing = bool(pb.get("is_playing"))
     return uri, prog_ms // 1000, dur_ms // 1000, is_playing
 
+
 def _update_now_playing(sp_user):
-    """Refresh CURRENT_URI/CURRENT_DURATION_SEC; reset dedupe on change; start cooldown on change."""
+    """
+    Refresh CURRENT_URI/CURRENT_DURATION_SEC.
+    Reset dedupe if the song changed, and start a short cooldown.
+    Remove the newly playing track from the vote queue.
+    """
     global CURRENT_URI, CURRENT_DURATION_SEC, QUEUED_NEXT_FOR_URI, COOLDOWN_UNTIL
+
     uri, prog_sec, dur_sec, is_playing = _progress_state(sp_user)
     now = time.time()
     changed = False
+
     with STATE_LOCK:
         if uri != CURRENT_URI:
             changed = True
             if uri:
                 log(f"Now playing → {uri} ({prog_sec}/{dur_sec}s)")
+            else:
+                log("Now playing → nothing")
             CURRENT_URI = uri
             CURRENT_DURATION_SEC = dur_sec if uri else None
             QUEUED_NEXT_FOR_URI = None
             COOLDOWN_UNTIL = now + START_COOLDOWN_SECONDS
+
     if uri and uri.startswith("spotify:track:"):
         tid = uri.split(":")[-1]
         _ensure_track_cached_by_tid(tid, sp_user=sp_user)
         if changed:
-            try:
-                votes.pop(tid, None)
-            except Exception:
-                pass
+            votes.pop(tid, None)
+
     return uri, prog_sec, dur_sec, is_playing
 
-def _candidate_next_uri(current_uri):
-    exclude_tid = current_uri.split(":")[-1] if current_uri and current_uri.startswith("spotify:track:") else None
-    ids = _ordered_ids(exclude_tid=exclude_tid)
-    return f"spotify:track:{ids[0]}" if ids else None
 
 # ─── Background loop ───────────────────────────────────────────────────────────
 def _background_loop():
-    global QUEUED_NEXT_FOR_URI, LAST_PAUSED_TS
+    global QUEUED_NEXT_FOR_URI, LAST_PAUSED_TS, COOLDOWN_UNTIL
+
+    log("Background loop started")
+
     while True:
         try:
             if not AUTO_ENABLED:
-                time.sleep(POLL_SECONDS); continue
+                time.sleep(POLL_SECONDS)
+                continue
+
             sp_user = _user_sp()
             if not sp_user:
-                time.sleep(POLL_SECONDS); continue
+                time.sleep(POLL_SECONDS)
+                continue
+
+            device = _resolve_target_device(sp_user, prefer_active=False)
+            if not device:
+                log("No Spotify device available for queue control")
+                time.sleep(POLL_SECONDS)
+                continue
+
             uri, prog_sec, dur_sec, is_playing = _update_now_playing(sp_user)
             if not uri or dur_sec is None:
-                time.sleep(POLL_SECONDS); continue
+                time.sleep(POLL_SECONDS)
+                continue
+
             now = time.time()
             in_cooldown = now < COOLDOWN_UNTIL
 
@@ -219,37 +322,71 @@ def _background_loop():
                 LAST_PAUSED_TS = None
 
             if in_cooldown:
-                time.sleep(POLL_SECONDS); continue
+                time.sleep(POLL_SECONDS)
+                continue
 
-            if AUTO_RESUME and not is_playing and LAST_PAUSED_TS and (now - LAST_PAUSED_TS) >= PAUSE_GRACE_SECONDS:
+            if (
+                AUTO_RESUME
+                and not is_playing
+                and LAST_PAUSED_TS
+                and (now - LAST_PAUSED_TS) >= PAUSE_GRACE_SECONDS
+            ):
                 try:
-                    sp_user.start_playback()
-                    log("Auto-resume after grace period")
+                    sp_user.start_playback(device_id=DEVICE_ID)
+                    log(f"Auto-resume after grace period on {DEVICE_NAME} ({DEVICE_ID})")
                     with STATE_LOCK:
-                        globals()['COOLDOWN_UNTIL'] = time.time() + 1.0
-                except spotipy.SpotifyException:
-                    pass
-                time.sleep(POLL_SECONDS); continue
+                        COOLDOWN_UNTIL = time.time() + 1.0
+                except spotipy.SpotifyException as e:
+                    log(f"Auto-resume failed on {DEVICE_NAME} ({DEVICE_ID}): {e}")
+                time.sleep(POLL_SECONDS)
+                continue
 
             threshold = max(0, dur_sec - QUEUE_AHEAD_SECONDS)
             if prog_sec is not None and prog_sec >= threshold and is_playing:
                 next_uri = _candidate_next_uri(uri)
                 with STATE_LOCK:
-                    already = (QUEUED_NEXT_FOR_URI == next_uri and next_uri is not None)
+                    already = (
+                        QUEUED_NEXT_FOR_URI == next_uri and next_uri is not None
+                    )
+
                 if next_uri and not already:
                     try:
-                        sp_user.add_to_queue(next_uri)
-                        log(f"Queued next: {next_uri} (prog={prog_sec}s / dur={dur_sec}s)")
+                        sp_user.add_to_queue(next_uri, device_id=DEVICE_ID)
+                        log(
+                            f"Queued next on {DEVICE_NAME} ({DEVICE_ID}): "
+                            f"{next_uri} (prog={prog_sec}s / dur={dur_sec}s)"
+                        )
                         with STATE_LOCK:
                             QUEUED_NEXT_FOR_URI = next_uri
-                            globals()['COOLDOWN_UNTIL'] = time.time() + 1.0
-                    except spotipy.SpotifyException:
-                        pass
-        except Exception:
-            pass
+                            COOLDOWN_UNTIL = time.time() + 1.0
+                    except spotipy.SpotifyException as e:
+                        log(
+                            f"add_to_queue failed for {next_uri} on "
+                            f"{DEVICE_NAME} ({DEVICE_ID}): {e}"
+                        )
+
+        except Exception as e:
+            log(f"Background loop error: {e}")
+
         time.sleep(POLL_SECONDS)
 
-# ─── Template (unchanged UI) ──────────────────────────────────────────────────
+
+def _start_background_thread_once():
+    global BG_THREAD_STARTED
+
+    with BG_THREAD_LOCK:
+        if BG_THREAD_STARTED:
+            return
+
+        # Avoid starting twice under the Werkzeug reloader parent process.
+        if os.getenv("WERKZEUG_RUN_MAIN") == "false":
+            return
+
+        threading.Thread(target=_background_loop, daemon=True).start()
+        BG_THREAD_STARTED = True
+
+
+# ─── Template ──────────────────────────────────────────────────────────────────
 TEMPLATE = """
 <!doctype html>
 <html>
@@ -269,11 +406,14 @@ TEMPLATE = """
 </head>
 <body>
   <div class="topbar">
-    <h1>Spotify Vote Queue <span class="muted" style="font-size:0.8rem;">v0.26 (live)</span></h1>
+    <h1>Spotify Vote Queue <span class="muted" style="font-size:0.8rem;">device-pinned build</span></h1>
     {% if authed %}
       <span class="muted">Logged in ✔</span>
       <a class="btn" href="{{ url_for('play_first') }}">▶️ Start with top track</a>
       <span class="muted">Next enqueued ~{{ ahead }}s before end • Live updates</span>
+      {% if device_name %}
+        <span class="muted">Target device: {{ device_name }}</span>
+      {% endif %}
     {% else %}
       <a class="btn" href="{{ url_for('login') }}">🔐 Log in to Spotify</a>
     {% endif %}
@@ -367,7 +507,7 @@ TEMPLATE = """
 
         const npDiv = document.getElementById('nowPlaying');
         if (data.now_playing) {
-          const img = data.now_playing.image ? 
+          const img = data.now_playing.image ?
             '<img class="thumb" src="' + data.now_playing.image + '">' : '';
           const extra = data.now_playing.extra || '';
           npDiv.innerHTML = `
@@ -386,7 +526,7 @@ TEMPLATE = """
         const qDiv = document.getElementById('queueList');
         if (data.queue && data.queue.length) {
           const items = data.queue.map(item => {
-            const img = item.track.image ? 
+            const img = item.track.image ?
               '<img class="thumb" src="' + item.track.image + '">' : '';
             return `
               <li class="row">
@@ -421,27 +561,42 @@ TEMPLATE = """
 </html>
 """
 
+
 # ─── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
+    _start_background_thread_once()
+
     query = request.args.get("q")
     results = {}
+
     if query:
-        items = sp_search.search(q=query, type="track", limit=10)["tracks"]["items"]
-        for t in items:
-            tid = t["id"]
-            if tid not in tracks:
-                tracks[tid] = _track_dict_from_sp_item(t)
-            results[tid] = tracks[tid]
-            votes[tid] = votes.get(tid, 0)
+        try:
+            items = sp_search.search(q=query, type="track", limit=10)["tracks"]["items"]
+            for t in items:
+                tid = t["id"]
+                if tid not in tracks:
+                    tracks[tid] = _track_dict_from_sp_item(t)
+                results[tid] = tracks[tid]
+                votes[tid] = votes.get(tid, 0)
+        except Exception as e:
+            log(f"Search failed for query={query!r}: {e}")
 
     with STATE_LOCK:
         np_uri = CURRENT_URI
         dur = CURRENT_DURATION_SEC
-    np_tid = np_uri.split(":")[-1] if np_uri and np_uri.startswith("spotify:track:") else None
 
-    queue = [(tid, c) for tid, c in sorted(votes.items(), key=lambda x: x[1], reverse=True)
-             if c > 0 and tid != np_tid]
+    np_tid = (
+        np_uri.split(":")[-1]
+        if np_uri and np_uri.startswith("spotify:track:")
+        else None
+    )
+
+    queue = [
+        (tid, c)
+        for tid, c in sorted(votes.items(), key=lambda x: x[1], reverse=True)
+        if c > 0 and tid != np_tid
+    ]
 
     now_playing = None
     if np_tid:
@@ -460,7 +615,9 @@ def index():
         authed=bool(_get_token_info()),
         ahead=QUEUE_AHEAD_SECONDS,
         now_playing=now_playing,
+        device_name=DEVICE_NAME,
     )
+
 
 @app.route("/vote", methods=["POST"])
 def vote():
@@ -469,6 +626,7 @@ def vote():
         votes[tid] = votes.get(tid, 0) + 1
     return redirect(url_for("index"))
 
+
 @app.route("/downvote", methods=["POST"])
 def downvote():
     tid = request.form.get("track_id")
@@ -476,36 +634,33 @@ def downvote():
         votes[tid] = max(0, votes.get(tid, 0) - 1)
     return redirect(url_for("index"))
 
+
 @app.route("/clear", methods=["POST"])
 def clear():
     votes.clear()
     return redirect(url_for("index"))
 
+
 @app.route("/login")
 def login():
     return redirect(_oauth().get_authorize_url())
+
 
 @app.route("/callback")
 def callback():
     code = request.args.get("code")
     if not code:
         return "Missing code", 400
+
     token_info = _oauth().get_access_token(code=code, check_cache=False)
     _save_token_info(token_info)
     log("Logged in to Spotify")
     return redirect(url_for("index"))
 
-def _get_active_device(sp_user):
-    try:
-        devices = sp_user.devices().get("devices", [])
-    except spotipy.SpotifyException:
-        return None
-    return next((d for d in devices if d.get("is_active")), None)
-
 
 @app.route("/play_first")
 def play_first():
-    global AUTO_ENABLED
+    global AUTO_ENABLED, COOLDOWN_UNTIL, QUEUED_NEXT_FOR_URI
 
     ids = _ordered_ids()
     if not ids:
@@ -515,10 +670,10 @@ def play_first():
     if not sp_user:
         return redirect(url_for("login"))
 
-    active = _get_active_device(sp_user)
-    if not active:
+    device = _resolve_target_device(sp_user, prefer_active=True)
+    if not device:
         return (
-            "No active Spotify device. Start playback on your phone first, "
+            "No Spotify device found. Start playback on your phone or desktop first, "
             "then come back and press this again.",
             400,
         )
@@ -527,23 +682,23 @@ def play_first():
     top_uri = f"spotify:track:{top_id}"
 
     try:
-        # Important: do NOT transfer playback.
-        # Only start on the device that is already active.
-        sp_user.start_playback(device_id=active["id"], uris=[top_uri])
-        log(f"Start with top track on active device {active['name']} → {top_uri}")
+        # Start only on the chosen device. Do not rely on an implicit device later.
+        sp_user.start_playback(device_id=DEVICE_ID, uris=[top_uri])
+        log(f"Start with top track on {DEVICE_NAME} ({DEVICE_ID}) → {top_uri}")
     except spotipy.SpotifyException as e:
-        return f"Failed to start on active device: {e}", 400
+        return f"Failed to start on target device: {e}", 400
 
     votes.pop(top_id, None)
     time.sleep(0.7)
     _update_now_playing(sp_user)
 
     with STATE_LOCK:
-        globals()["COOLDOWN_UNTIL"] = time.time() + START_COOLDOWN_SECONDS
-        globals()["QUEUED_NEXT_FOR_URI"] = None
+        COOLDOWN_UNTIL = time.time() + START_COOLDOWN_SECONDS
+        QUEUED_NEXT_FOR_URI = None
 
     AUTO_ENABLED = True
     return redirect(url_for("index"))
+
 
 @app.route("/status.json")
 def status_json():
@@ -551,22 +706,26 @@ def status_json():
     if sp_user:
         try:
             _update_now_playing(sp_user)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"status.json update_now_playing failed: {e}")
+
     with STATE_LOCK:
         uri = CURRENT_URI
         dur = CURRENT_DURATION_SEC
+
     np = None
     progress = None
     is_playing = None
+
     if sp_user and uri:
         try:
             _uri, progress, _dur, is_playing = _progress_state(sp_user)
             if _uri != uri:
                 uri = _uri
                 dur = _dur
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"status.json progress read failed: {e}")
+
     if uri and uri.startswith("spotify:track:"):
         tid = uri.split(":")[-1]
         _ensure_track_cached_by_tid(tid, sp_user=sp_user)
@@ -580,40 +739,63 @@ def status_json():
                 extra_bits.append(f"{rem}s left")
             if is_playing is False:
                 extra_bits.append("paused")
+
             np = {
                 "track_id": tid,
                 "name": meta["name"],
                 "artist": meta["artist"],
                 "image": meta["image"],
-                "extra": " • ".join(extra_bits) if extra_bits else None
+                "extra": " • ".join(extra_bits) if extra_bits else None,
             }
-    exclude_tid = uri.split(":")[-1] if uri and uri.startswith("spotify:track:") else None
+
+    exclude_tid = (
+        uri.split(":")[-1]
+        if uri and uri.startswith("spotify:track:")
+        else None
+    )
     ids = _ordered_ids(exclude_tid=exclude_tid)
+
     queue_payload = []
     for tid in ids:
         _ensure_track_cached_by_tid(tid, sp_user=sp_user)
         meta = tracks.get(tid, {})
-        queue_payload.append({
-            "track_id": tid,
-            "votes": int(votes.get(tid, 0)),
-            "track": {"name": meta.get("name"), "artist": meta.get("artist"), "image": meta.get("image")}
-        })
-    return jsonify({
-        "version": "0.26",
-        "authed": bool(_get_token_info()),
-        "ahead_seconds": QUEUE_AHEAD_SECONDS,
-        "now_playing": np,
-        "queue": queue_payload,
-        "ts": int(time.time())
-    })
+        queue_payload.append(
+            {
+                "track_id": tid,
+                "votes": int(votes.get(tid, 0)),
+                "track": {
+                    "name": meta.get("name"),
+                    "artist": meta.get("artist"),
+                    "image": meta.get("image"),
+                },
+            }
+        )
 
-# ─── Background thread ─────────────────────────────────────────────────────────
-threading.Thread(target=_background_loop, daemon=True).start()
+    return jsonify(
+        {
+            "version": "device-pinned",
+            "authed": bool(_get_token_info()),
+            "ahead_seconds": QUEUE_AHEAD_SECONDS,
+            "now_playing": np,
+            "queue": queue_payload,
+            "device_id": DEVICE_ID,
+            "device_name": DEVICE_NAME,
+            "ts": int(time.time()),
+        }
+    )
 
-# ─── Entrypoint ────────────────────────────────────────────────────────────────
+
+# ─── Startup ───────────────────────────────────────────────────────────────────
+_start_background_thread_once()
+
 if __name__ == "__main__":
-    # Local dev: http://127.0.0.1:5000 with optional adhoc TLS if you want (commented)
     host = "0.0.0.0" if os.getenv("RENDER", "0") == "1" else "127.0.0.1"
     port = int(os.getenv("PORT", "5000"))
-    # Don’t set ssl_context on Render (TLS is handled by the platform)
+
+    if os.getenv("WEB_CONCURRENCY", "1") != "1":
+        log(
+            "WARNING: WEB_CONCURRENCY is not 1. This app stores queue/playback "
+            "state in memory and should run as a single worker."
+        )
+
     app.run(host=host, port=port, debug=True)
