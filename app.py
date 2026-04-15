@@ -495,36 +495,53 @@ def callback():
     log("Logged in to Spotify")
     return redirect(url_for("index"))
 
+def _get_active_device(sp_user):
+    try:
+        devices = sp_user.devices().get("devices", [])
+    except spotipy.SpotifyException:
+        return None
+    return next((d for d in devices if d.get("is_active")), None)
+
+
 @app.route("/play_first")
 def play_first():
-    global AUTO_ENABLED, DEVICE_ID
+    global AUTO_ENABLED
+
     ids = _ordered_ids()
     if not ids:
         return redirect(url_for("index"))
+
     sp_user = _user_sp()
     if not sp_user:
         return redirect(url_for("login"))
-    if not DEVICE_ID:
-        DEVICE_ID = _pick_device(sp_user)
-    if not DEVICE_ID:
-        return "No available devices", 400
+
+    active = _get_active_device(sp_user)
+    if not active:
+        return (
+            "No active Spotify device. Start playback on your phone first, "
+            "then come back and press this again.",
+            400,
+        )
+
     top_id = ids[0]
     top_uri = f"spotify:track:{top_id}"
+
     try:
-        try:
-            sp_user.transfer_playback(device_id=DEVICE_ID, force_play=False)
-        except spotipy.SpotifyException:
-            pass
-        sp_user.start_playback(device_id=DEVICE_ID, uris=[top_uri])
-        log(f"Start with top track {top_uri}")
+        # Important: do NOT transfer playback.
+        # Only start on the device that is already active.
+        sp_user.start_playback(device_id=active["id"], uris=[top_uri])
+        log(f"Start with top track on active device {active['name']} → {top_uri}")
     except spotipy.SpotifyException as e:
-        return f"Failed to start: {e}", 400
+        return f"Failed to start on active device: {e}", 400
+
     votes.pop(top_id, None)
     time.sleep(0.7)
     _update_now_playing(sp_user)
+
     with STATE_LOCK:
-        globals()['COOLDOWN_UNTIL'] = time.time() + START_COOLDOWN_SECONDS
-        globals()['QUEUED_NEXT_FOR_URI'] = None
+        globals()["COOLDOWN_UNTIL"] = time.time() + START_COOLDOWN_SECONDS
+        globals()["QUEUED_NEXT_FOR_URI"] = None
+
     AUTO_ENABLED = True
     return redirect(url_for("index"))
 
