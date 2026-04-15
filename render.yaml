@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: spotify-vote-queue
+    name: loudsource3
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
