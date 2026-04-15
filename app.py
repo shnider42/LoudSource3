@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # loud_0_26_render.py — v0.26 (Render-ready)
-from flask import Flask, request, render_template_string, redirect, url_for, session, jsonify
+from flask import Flask, request, render_template_string, redirect, url_for, session, jsonify, has_request_context
 import os, time, threading
 from collections import defaultdict
 import spotipy
@@ -85,8 +85,17 @@ def _get_token_info():
     global TOKEN_INFO
     with TOKEN_LOCK:
         ti = TOKEN_INFO
+
+    # Fall back to the signed session cookie during request handling.
+    if not ti and has_request_context():
+        ti = session.get("token_info")
+        if ti:
+            with TOKEN_LOCK:
+                TOKEN_INFO = ti
+
     if not ti:
         return None
+
     # Refresh near expiry
     if ti.get("expires_at", 0) - int(time.time()) < 60:
         try:
@@ -97,7 +106,8 @@ def _get_token_info():
             return None
         with TOKEN_LOCK:
             TOKEN_INFO = ti
-        session["token_info"] = ti
+        if has_request_context():
+            session["token_info"] = ti
     return ti
 
 def _user_sp():
@@ -240,7 +250,7 @@ def _background_loop():
         time.sleep(POLL_SECONDS)
 
 # ─── Template (unchanged UI) ──────────────────────────────────────────────────
-TEMPLATE = """{% raw %}
+TEMPLATE = """
 <!doctype html>
 <html>
 <head>
@@ -409,7 +419,7 @@ TEMPLATE = """{% raw %}
   </script>
 </body>
 </html>
-{% endraw %}"""
+"""
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
