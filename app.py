@@ -20,6 +20,7 @@ from flask import (
 import os
 import time
 import threading
+import requests
 from collections import defaultdict
 
 import spotipy
@@ -897,6 +898,64 @@ def devices_json():
         }
     )
 
+
+@app.route("/queue_sanity")
+def queue_sanity():
+    ti = _get_token_info()
+    if not ti:
+        return redirect(url_for("login"))
+
+    test_uri = request.args.get("uri", "spotify:track:4uLU6hMCjMI75M1A2tKUQC")
+    headers = {"Authorization": f"Bearer {ti['access_token']}"}
+
+    result = {
+        "test_uri": test_uri,
+        "authed": True,
+    }
+
+    try:
+        devices_resp = requests.get(
+            "https://api.spotify.com/v1/me/player/devices",
+            headers=headers,
+            timeout=15,
+        )
+        result["devices_status"] = devices_resp.status_code
+        try:
+            result["devices_json"] = devices_resp.json()
+        except Exception:
+            result["devices_text"] = devices_resp.text
+    except Exception as e:
+        result["devices_error"] = str(e)
+
+    try:
+        playback_resp = requests.get(
+            "https://api.spotify.com/v1/me/player",
+            headers=headers,
+            timeout=15,
+        )
+        result["playback_status"] = playback_resp.status_code
+        try:
+            result["playback_json"] = playback_resp.json()
+        except Exception:
+            result["playback_text"] = playback_resp.text
+    except Exception as e:
+        result["playback_error"] = str(e)
+
+    try:
+        queue_resp = requests.post(
+            "https://api.spotify.com/v1/me/player/queue",
+            headers=headers,
+            params={"uri": test_uri},
+            timeout=15,
+        )
+        result["queue_status"] = queue_resp.status_code
+        result["queue_text"] = queue_resp.text
+        result["queue_ok"] = queue_resp.status_code == 204
+    except Exception as e:
+        result["queue_error"] = str(e)
+        result["queue_ok"] = False
+
+    return jsonify(result)
 
 # ─── Startup ───────────────────────────────────────────────────────────────────
 _start_background_thread_once()
