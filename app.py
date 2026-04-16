@@ -241,6 +241,8 @@ def _candidate_next_tid(current_uri):
 # ─── Playback snapshot helpers ─────────────────────────────────────────────────
 def _snapshot_from_current_playback(sp_user):
     try:
+        if DEBUG_VERBOSE == True:
+            log("DEBUG --- in the first try statement '_snapshot_from_current_playback(sp_user)' --- DEBUG")
         pb = sp_user.current_playback()
     except spotipy.SpotifyException as e:
         log(f"current_playback() failed: {e}")
@@ -353,6 +355,9 @@ def _update_now_playing_from_snapshot(sp_user, snapshot):
 
 
 def _should_attempt_queue(snapshot):
+    if DEBUG_VERBOSE == True:
+        log("DEBUG --- inside _should_attempt_queue() --- DEBUG")
+
     if not snapshot:
         return False
     if not snapshot["uri"] or snapshot["duration_ms"] <= 0:
@@ -429,8 +434,6 @@ def _is_valid_track_id(tid):
 def _background_loop():
     global LAST_PAUSED_TS, LAST_PROGRESS_LOG_TS, COOLDOWN_UNTIL
 
-    log("Background loop started")
-
     if DEBUG_VERBOSE == True:
         log("DEBUG --- Background loop started --- DEBUG")
 
@@ -446,6 +449,11 @@ def _background_loop():
                 continue
 
             snapshot = _playback_snapshot(sp_user)
+            if DEBUG_VERBOSE == True:
+                log("\nDEBUG ----- SNAPSHOT ----- \n")
+                str_snapshot = str(snapshot)
+                log(str_snapshot)
+                log("\n----- DEBUG -----\n")
             _update_now_playing_from_snapshot(sp_user, snapshot)
 
             if not snapshot:
@@ -458,6 +466,8 @@ def _background_loop():
 
             # Periodic progress logging every 5 seconds while monitoring
             if now - LAST_PROGRESS_LOG_TS >= 5:
+                if DEBUG_VERBOSE == True:
+                    log("DEBUG --- 'if now - LAST_PROGRESS_LOG_TS >= 5' --- DEBUG")
                 LAST_PROGRESS_LOG_TS = now
                 log(
                     f"Monitor: {snapshot['track_id']} "
@@ -494,6 +504,8 @@ def _background_loop():
                 continue
 
             if _should_attempt_queue(snapshot):
+                if DEBUG_VERBOSE == True:
+                    log("DEBUG --- Background loop started --- DEBUG")
                 log(
                     f"Threshold reached: current={snapshot['uri']} "
                     f"remaining={snapshot['remaining_sec']}s "
@@ -1088,16 +1100,21 @@ def queue_sanity2():
     return jsonify(result)
 
 # ─── Startup ───────────────────────────────────────────────────────────────────
-if DEBUG_VERBOSE == True:
-    log("DEBUG --- starting index() --- DEBUG")
-    index()
-else:
-    log("DEBUG --- normal non debug behavior --- DEBUG")
-    _start_background_thread_once()
+#if DEBUG_VERBOSE == True:
+#    log("DEBUG --- starting index() INSTEAD OF DEFAULT, THIS FLAG NEEDS TO BE WATCHED --- DEBUG")
+#    index()
+#else:
+#    log("DEBUG --- normal non debug behavior --- DEBUG")
+#    _start_background_thread_once()
+
+_start_background_thread_once()
 
 if __name__ == "__main__":
     host = "0.0.0.0" if os.getenv("RENDER", "0") == "1" else "127.0.0.1"
     port = int(os.getenv("PORT", "5000"))
+
+    if DEBUG_VERBOSE == True:
+        log("DEBUG --- main started correctly --- DEBUG")
 
     if os.getenv("WEB_CONCURRENCY", "1") != "1":
         log(
