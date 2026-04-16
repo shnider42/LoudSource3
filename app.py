@@ -19,6 +19,7 @@ from flask import (
 )
 import os
 import time
+import re
 import threading
 import requests
 import time
@@ -29,6 +30,8 @@ from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
 
 
 # ─── Config ────────────────────────────────────────────────────────────────────
+DEBUG_VERBOSE = True
+
 SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID", "").strip()
 SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET", "").strip()
 SPOTIPY_REDIRECT_URI = os.getenv(
@@ -367,7 +370,14 @@ def _queue_next_for_snapshot(sp_user, snapshot):
         log("Queue skip: no next candidate from votes")
         return False, "no_next_candidate"
 
+    #next_uri = f"spotify:track:{next_tid}"
+
+    if not _is_valid_track_id(next_tid):
+        log(f"Bad next_tid: {next_tid!r}")
+        return False, "bad_track_id"
+
     next_uri = f"spotify:track:{next_tid}"
+    log(f"Queueing URI: {next_uri}")
 
     with STATE_LOCK:
         if QUEUED_NEXT_FOR_URI == snapshot["uri"]:
@@ -412,12 +422,17 @@ def _queue_next_for_snapshot(sp_user, snapshot):
         log(f"Queue request exception for {next_uri}: {e}")
         return False, str(e)
 
+def _is_valid_track_id(tid):
+    return isinstance(tid, str) and re.fullmatch(r"[A-Za-z0-9]{22}", tid) is not None
 
 # ─── Background loop ───────────────────────────────────────────────────────────
 def _background_loop():
     global LAST_PAUSED_TS, LAST_PROGRESS_LOG_TS, COOLDOWN_UNTIL
 
     log("Background loop started")
+
+    if DEBUG_VERBOSE == True:
+        log("DEBUG --- Background loop started --- DEBUG")
 
     while True:
         try:
@@ -684,6 +699,8 @@ TEMPLATE = """
 # ─── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
+    if DEBUG_VERBOSE == True:
+        log("DEBUG --- index() started --- DEBUG")
     _start_background_thread_once()
 
     query = request.args.get("q")
@@ -827,6 +844,7 @@ def play_first():
     with STATE_LOCK:
         COOLDOWN_UNTIL = time.time() + START_COOLDOWN_SECONDS
         QUEUED_NEXT_FOR_URI = None
+        log(f"STATE_LOCK END OF WITH STATEMENT")
 
     AUTO_ENABLED = True
     return redirect(url_for("index"))
@@ -1070,7 +1088,12 @@ def queue_sanity2():
     return jsonify(result)
 
 # ─── Startup ───────────────────────────────────────────────────────────────────
-_start_background_thread_once()
+if DEBUG_VERBOSE == True:
+    log("DEBUG --- starting index() --- DEBUG")
+    index()
+else:
+    log("DEBUG --- normal non debug behavior --- DEBUG")
+    _start_background_thread_once()
 
 if __name__ == "__main__":
     host = "0.0.0.0" if os.getenv("RENDER", "0") == "1" else "127.0.0.1"
