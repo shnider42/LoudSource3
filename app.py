@@ -21,6 +21,7 @@ import os
 import time
 import threading
 import requests
+import time
 from collections import defaultdict
 
 import spotipy
@@ -363,27 +364,52 @@ def _queue_next_for_snapshot(sp_user, snapshot):
 
     next_tid = _candidate_next_tid(snapshot["uri"])
     if not next_tid:
+        log("Queue skip: no next candidate from votes")
         return False, "no_next_candidate"
 
     next_uri = f"spotify:track:{next_tid}"
 
     with STATE_LOCK:
         if QUEUED_NEXT_FOR_URI == snapshot["uri"]:
+            log(f"Queue skip: already queued for current song {snapshot['uri']}")
             return False, "already_queued_for_current_song"
+
+    ti = _get_token_info()
+    if not ti:
+        log("Queue skip: missing token info")
+        return False, "missing_token"
+
+    headers = {"Authorization": f"Bearer {ti['access_token']}"}
 
     try:
         LAST_QUEUE_ATTEMPT_TS = time.time()
-        sp_user.add_to_queue(next_uri)
-        with STATE_LOCK:
-            QUEUED_NEXT_FOR_URI = snapshot["uri"]
-            COOLDOWN_UNTIL = time.time() + 1.0
-        log(
-            f"Queued next on active device ({ACTIVE_DEVICE_NAME or 'unknown'}): {next_uri} "
-            f"with {snapshot['remaining_sec']}s left"
+
+        resp = requests.post(
+            "https://api.spotify.com/v1/me/player/queue",
+            headers=headers,
+            params={"uri": next_uri},
+            timeout=15,
+            allow_redirects=False,
         )
-        return True, next_uri
-    except spotipy.SpotifyException as e:
-        log(f"add_to_queue failed on active device for {next_uri}: {e}")
+
+        log(
+            f"Queue attempt: next_uri={next_uri} "
+            f"remaining={snapshot['remaining_sec']}s "
+            f"status={resp.status_code} body={resp.text!r}"
+        )
+
+        # Your sanity route proved that 200 can still functionally queue.
+        if resp.status_code in (200, 204):
+            with STATE_LOCK:
+                QUEUED_NEXT_FOR_URI = snapshot["uri"]
+                COOLDOWN_UNTIL = time.time() + 1.0
+            log(f"Queued next successfully: {next_uri}")
+            return True, next_uri
+
+        return False, f"status={resp.status_code} body={resp.text}"
+
+    except Exception as e:
+        log(f"Queue request exception for {next_uri}: {e}")
         return False, str(e)
 
 
@@ -453,6 +479,11 @@ def _background_loop():
                 continue
 
             if _should_attempt_queue(snapshot):
+                log(
+                    f"Threshold reached: current={snapshot['uri']} "
+                    f"remaining={snapshot['remaining_sec']}s "
+                    f"next_candidate={_candidate_next_tid(snapshot['uri'])}"
+                )
                 _queue_next_for_snapshot(sp_user, snapshot)
 
         except Exception as e:
@@ -954,6 +985,87 @@ def queue_sanity():
     except Exception as e:
         result["queue_error"] = str(e)
         result["queue_ok"] = False
+
+    return jsonify(result)
+
+@app.route("/queue_sanity2")
+def queue_sanity2():
+    ti = _get_token_info()
+    if not ti:
+        return redirect(url_for("login"))
+
+    test_uri = request.args.get("uri", "spotify:track:4uLU6hMCjMI75M1A2tKUQC")
+    headers = {"Authorization": f"Bearer {ti['access_token']}"}
+
+    result = {
+        "test_uri": test_uri,
+        "authed": True,
+    }
+
+    # Active devices
+    devices_resp = requests.get(
+        "https://api.spotify.com/v1/me/player/devices",
+        headers=headers,
+        timeout=15,
+        allow_redirects=False,
+    )
+    result["devices_status"] = devices_resp.status_code
+    try:
+        result["devices_json"] = devices_resp.json()
+    except Exception:
+        result["devices_text"] = devices_resp.text
+
+    # Current playback
+    playback_resp = requests.get(
+        "https://api.spotify.com/v1/me/player",
+        headers=headers,
+        timeout=15,
+        allow_redirects=False,
+    )
+    result["playback_status"] = playback_resp.status_code
+    try:
+        result["playback_json"] = playback_resp.json()
+    except Exception:
+        result["playback_text"] = playback_resp.text
+
+    # POST to queue
+    queue_post = requests.post(
+        "https://api.spotify.com/v1/me/player/queue",
+        headers=headers,
+        params={"uri": test_uri},
+        timeout=15,
+        allow_redirects=False,
+    )
+    result["queue_post_status"] = queue_post.status_code
+    result["queue_post_url"] = queue_post.url
+    result["queue_post_headers"] = dict(queue_post.headers)
+    result["queue_post_text"] = queue_post.text
+
+    # Give Spotify a moment, then read queue back
+    time.sleep(1.0)
+
+    queue_get = requests.get(
+        "https://api.spotify.com/v1/me/player/queue",
+        headers=headers,
+        timeout=15,
+        allow_redirects=False,
+    )
+    result["queue_get_status"] = queue_get.status_code
+    result["queue_get_url"] = queue_get.url
+
+    try:
+        qj = queue_get.json()
+        result["queue_get_json"] = qj
+
+        queue_items = qj.get("queue", []) or []
+        result["queue_uris"] = [item.get("uri") for item in queue_items[:10]]
+        result["queue_names"] = [item.get("name") for item in queue_items[:10]]
+        result["test_uri_found_in_queue"] = any(
+            item.get("uri") == test_uri for item in queue_items
+        )
+    except Exception:
+        result["queue_get_text"] = queue_get.text
+        result["test_uri_found_in_queue"] = False
 
     return jsonify(result)
 
