@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # app.py — Spotify vote queue, Render-ready
 #
-# Drop-in replacement:
+# Active-device-only version:
 # - keeps the same web UI/routes
-# - makes device selection stricter (controllable/unrestricted only)
-# - activates/transfers playback to a real device before starting the first track
-# - retries add_to_queue more defensively if the device changed underneath us
-# - adds a devices.json debug route
+# - removes explicit device_id targeting
+# - start/queue/resume all rely on Spotify's current active device
+# - simpler for sanity-checking whether Spotify queueing works at all
 
 from flask import (
     Flask,
@@ -45,7 +44,6 @@ POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
 AUTO_RESUME = os.getenv("AUTO_RESUME", "true").lower() == "true"
 PAUSE_GRACE_SECONDS = int(os.getenv("PAUSE_GRACE_SECONDS", "6"))
 START_COOLDOWN_SECONDS = float(os.getenv("START_COOLDOWN_SECONDS", "2"))
-DEVICE_SETTLE_SECONDS = float(os.getenv("DEVICE_SETTLE_SECONDS", "0.9"))
 
 # ─── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -78,16 +76,13 @@ CURRENT_URI = None
 CURRENT_DURATION_SEC = None
 CURRENT_PROGRESS_SEC = None
 CURRENT_IS_PLAYING = None
+ACTIVE_DEVICE_NAME = None
 
 QUEUED_NEXT_FOR_URI = None          # current song URI for which next song has been queued
 LAST_QUEUE_ATTEMPT_TS = 0.0
 LAST_PROGRESS_LOG_TS = 0.0
 
 AUTO_ENABLED = False
-
-DEVICE_ID = None
-DEVICE_NAME = None
-DEVICE_TYPE = None
 
 COOLDOWN_UNTIL = 0.0
 LAST_PAUSED_TS = None
@@ -172,73 +167,12 @@ def _list_devices(sp_user):
         return []
 
 
-def _is_controllable_device(d):
-    return bool(d.get("id")) and not bool(d.get("is_restricted", False))
-
-
-def _remember_device(device):
-    global DEVICE_ID, DEVICE_NAME, DEVICE_TYPE
-    if not device:
-        return
-    DEVICE_ID = device.get("id")
-    DEVICE_NAME = device.get("name")
-    DEVICE_TYPE = device.get("type")
-
-
-def _resolve_target_device(sp_user, prefer_active=False):
-    """
-    Only choose controllable devices. Avoid restricted / unusable targets.
-    """
+def _active_device(sp_user):
+    global ACTIVE_DEVICE_NAME
     devices = _list_devices(sp_user)
-    controllable = [d for d in devices if _is_controllable_device(d)]
-    if not controllable:
-        return None
-
-    chosen = None
-    if prefer_active:
-        chosen = next((d for d in controllable if d.get("is_active")), None)
-
-    if not chosen and DEVICE_ID:
-        chosen = next((d for d in controllable if d.get("id") == DEVICE_ID), None)
-
-    if not chosen:
-        chosen = next((d for d in controllable if d.get("is_active")), None)
-
-    if not chosen:
-        chosen = controllable[0]
-
-    _remember_device(chosen)
-    return chosen
-
-
-def _activate_device(sp_user, device, force_play=False):
-    if not device or not device.get("id"):
-        return False
-
-    _remember_device(device)
-
-    if device.get("is_active"):
-        return True
-
-    try:
-        sp_user.transfer_playback(device_id=device["id"], force_play=force_play)
-        log(
-            f"Transferred playback to {device.get('name')} "
-            f"({device.get('id')}) force_play={force_play}"
-        )
-        time.sleep(DEVICE_SETTLE_SECONDS)
-    except spotipy.SpotifyException as e:
-        log(
-            f"transfer_playback failed for {device.get('name')} "
-            f"({device.get('id')}): {e}"
-        )
-        return False
-
-    refreshed = _resolve_target_device(sp_user, prefer_active=True)
-    if refreshed and refreshed.get("id") == device.get("id"):
-        return True
-
-    return False
+    active = next((d for d in devices if d.get("is_active")), None)
+    ACTIVE_DEVICE_NAME = active.get("name") if active else None
+    return active
 
 
 def _device_debug_payload(sp_user):
@@ -309,6 +243,10 @@ def _snapshot_from_current_playback(sp_user):
 
     if not pb or not pb.get("item"):
         return None
+
+    device = pb.get("device") or {}
+    global ACTIVE_DEVICE_NAME
+    ACTIVE_DEVICE_NAME = device.get("name") or ACTIVE_DEVICE_NAME
 
     item = pb["item"]
     progress_ms = pb.get("progress_ms") or 0
@@ -432,55 +370,6 @@ def _queue_next_for_snapshot(sp_user, snapshot):
         if QUEUED_NEXT_FOR_URI == snapshot["uri"]:
             return False, "already_queued_for_current_song"
 
-    target = _resolve_target_device(sp_user, prefer_active=True) or _resolve_target_device(
-        sp_user, prefer_active=False
-    )
-    if not target:
-        return False, "no_controllable_device"
-
-    target_id = target.get("id")
-    target_name = target.get("name")
-
-    try:
-        LAST_QUEUE_ATTEMPT_TS = time.time()
-        sp_user.add_to_queue(next_uri, device_id=target_id)
-        with STATE_LOCK:
-            QUEUED_NEXT_FOR_URI = snapshot["uri"]
-            COOLDOWN_UNTIL = time.time() + 1.0
-        log(
-            f"Queued next on {target_name} ({target_id}): {next_uri} "
-            f"with {snapshot['remaining_sec']}s left"
-        )
-        return True, next_uri
-    except spotipy.SpotifyException as e:
-        log(
-            f"add_to_queue failed on {target_name} ({target_id}) "
-            f"for {next_uri}: {e}"
-        )
-
-    # Retry path 1: if the cached target is no longer active/reachable, resolve again.
-    retry_target = _resolve_target_device(sp_user, prefer_active=True)
-    if retry_target and retry_target.get("id") != target_id:
-        retry_id = retry_target.get("id")
-        retry_name = retry_target.get("name")
-        try:
-            LAST_QUEUE_ATTEMPT_TS = time.time()
-            sp_user.add_to_queue(next_uri, device_id=retry_id)
-            with STATE_LOCK:
-                QUEUED_NEXT_FOR_URI = snapshot["uri"]
-                COOLDOWN_UNTIL = time.time() + 1.0
-            log(
-                f"Queued next on retry target {retry_name} ({retry_id}): {next_uri} "
-                f"with {snapshot['remaining_sec']}s left"
-            )
-            return True, next_uri
-        except spotipy.SpotifyException as e:
-            log(
-                f"Retry add_to_queue failed on {retry_name} ({retry_id}) "
-                f"for {next_uri}: {e}"
-            )
-
-    # Retry path 2: fall back to active-device default behavior.
     try:
         LAST_QUEUE_ATTEMPT_TS = time.time()
         sp_user.add_to_queue(next_uri)
@@ -488,12 +377,12 @@ def _queue_next_for_snapshot(sp_user, snapshot):
             QUEUED_NEXT_FOR_URI = snapshot["uri"]
             COOLDOWN_UNTIL = time.time() + 1.0
         log(
-            f"Queued next on Spotify active device fallback: {next_uri} "
+            f"Queued next on active device ({ACTIVE_DEVICE_NAME or 'unknown'}): {next_uri} "
             f"with {snapshot['remaining_sec']}s left"
         )
         return True, next_uri
     except spotipy.SpotifyException as e:
-        log(f"Final add_to_queue fallback failed for {next_uri}: {e}")
+        log(f"add_to_queue failed on active device for {next_uri}: {e}")
         return False, str(e)
 
 
@@ -514,18 +403,11 @@ def _background_loop():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            device = _resolve_target_device(sp_user, prefer_active=True) or _resolve_target_device(
-                sp_user, prefer_active=False
-            )
-            if not device:
-                log("No controllable Spotify device available for queue control")
-                time.sleep(POLL_SECONDS)
-                continue
-
             snapshot = _playback_snapshot(sp_user)
             _update_now_playing_from_snapshot(sp_user, snapshot)
 
             if not snapshot:
+                _active_device(sp_user)
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -540,7 +422,7 @@ def _background_loop():
                     f"{snapshot['progress_sec']}/{snapshot['duration_sec']}s "
                     f"remaining={snapshot['remaining_sec']}s "
                     f"playing={snapshot['is_playing']} "
-                    f"device={DEVICE_NAME}"
+                    f"device={ACTIVE_DEVICE_NAME}"
                 )
 
             if not snapshot["is_playing"]:
@@ -560,15 +442,12 @@ def _background_loop():
                 and (now - LAST_PAUSED_TS) >= PAUSE_GRACE_SECONDS
             ):
                 try:
-                    active = _resolve_target_device(sp_user, prefer_active=True) or device
-                    if active and not active.get("is_active"):
-                        _activate_device(sp_user, active, force_play=False)
-                    sp_user.start_playback(device_id=DEVICE_ID)
-                    log(f"Auto-resume after grace period on {DEVICE_NAME} ({DEVICE_ID})")
+                    sp_user.start_playback()
+                    log(f"Auto-resume on active device ({ACTIVE_DEVICE_NAME})")
                     with STATE_LOCK:
                         COOLDOWN_UNTIL = time.time() + 1.0
                 except spotipy.SpotifyException as e:
-                    log(f"Auto-resume failed on {DEVICE_NAME} ({DEVICE_ID}): {e}")
+                    log(f"Auto-resume failed on active device: {e}")
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -614,13 +493,13 @@ TEMPLATE = """
 </head>
 <body>
   <div class="topbar">
-    <h1>Spotify Vote Queue <span class="muted" style="font-size:0.8rem;">device-activation fix</span></h1>
+    <h1>Spotify Vote Queue <span class="muted" style="font-size:0.8rem;">active-device-only</span></h1>
     {% if authed %}
       <span class="muted">Logged in ✔</span>
       <a class="btn" href="{{ url_for('play_first') }}">▶️ Start with top track</a>
       <span class="muted">Poll {{ poll_seconds }}s • Queue at {{ ahead }}s remaining</span>
       {% if device_name %}
-        <span class="muted">Target device: {{ device_name }}</span>
+        <span class="muted">Active device: {{ device_name }}</span>
       {% endif %}
     {% else %}
       <a class="btn" href="{{ url_for('login') }}">🔐 Log in to Spotify</a>
@@ -778,6 +657,10 @@ def index():
     query = request.args.get("q")
     results = {}
 
+    sp_user = _user_sp()
+    if sp_user:
+        _active_device(sp_user)
+
     if query:
         try:
             items = sp_search.search(q=query, type="track", limit=10)["tracks"]["items"]
@@ -833,7 +716,7 @@ def index():
         ahead=QUEUE_AHEAD_SECONDS,
         poll_seconds=POLL_SECONDS,
         now_playing=now_playing,
-        device_name=DEVICE_NAME,
+        device_name=ACTIVE_DEVICE_NAME,
     )
 
 
@@ -887,38 +770,21 @@ def play_first():
     if not sp_user:
         return redirect(url_for("login"))
 
-    device = _resolve_target_device(sp_user, prefer_active=True) or _resolve_target_device(
-        sp_user, prefer_active=False
-    )
-    if not device:
+    active = _active_device(sp_user)
+    if not active:
         return (
-            "No controllable Spotify device found. Open Spotify on your phone, desktop app, or Spotify Web Player first, then try again.",
+            "No active Spotify device found. Start playback manually on your phone, desktop app, or Spotify Web Player first, then try again.",
             400,
         )
 
-    # If the device exists but is not active yet, transfer playback to it first.
-    if not device.get("is_active"):
-        ok = _activate_device(sp_user, device, force_play=False)
-        if not ok:
-            # One more fresh resolve in case Spotify changed state after we listed devices.
-            device = _resolve_target_device(sp_user, prefer_active=True) or device
-
     top_id = ids[0]
     top_uri = f"spotify:track:{top_id}"
-    target_id = DEVICE_ID or device.get("id")
 
     try:
-        sp_user.start_playback(device_id=target_id, uris=[top_uri])
-        log(f"Start with top track on {DEVICE_NAME} ({target_id}) → {top_uri}")
+        sp_user.start_playback(uris=[top_uri])
+        log(f"Start with top track on active device ({ACTIVE_DEVICE_NAME}) → {top_uri}")
     except spotipy.SpotifyException as e:
-        log(f"Initial start_playback failed on {DEVICE_NAME} ({target_id}): {e}")
-        try:
-            _activate_device(sp_user, device, force_play=True)
-            target_id = DEVICE_ID or device.get("id")
-            sp_user.start_playback(device_id=target_id, uris=[top_uri])
-            log(f"Start retry succeeded on {DEVICE_NAME} ({target_id}) → {top_uri}")
-        except spotipy.SpotifyException as e2:
-            return f"Failed to start on target device: {e2}", 400
+        return f"Failed to start on active device: {e}", 400
 
     votes.pop(top_id, None)
     time.sleep(0.7)
@@ -943,6 +809,7 @@ def status_json():
         try:
             snapshot = _playback_snapshot(sp_user)
             _update_now_playing_from_snapshot(sp_user, snapshot)
+            _active_device(sp_user)
         except Exception as e:
             log(f"status.json snapshot failed: {e}")
 
@@ -1000,16 +867,14 @@ def status_json():
     next_candidate_tid = _candidate_next_tid(uri)
     return jsonify(
         {
-            "version": "device-activation-fix",
+            "version": "active-device-only",
             "authed": bool(_get_token_info()),
             "ahead_seconds": QUEUE_AHEAD_SECONDS,
             "poll_seconds": POLL_SECONDS,
             "auto_enabled": AUTO_ENABLED,
             "now_playing": np,
             "queue": queue_payload,
-            "device_id": DEVICE_ID,
-            "device_name": DEVICE_NAME,
-            "device_type": DEVICE_TYPE,
+            "active_device_name": ACTIVE_DEVICE_NAME,
             "queued_next_for_uri": queued_for,
             "next_candidate_tid": next_candidate_tid,
             "ts": int(time.time()),
@@ -1022,12 +887,11 @@ def devices_json():
     sp_user = _user_sp()
     if not sp_user:
         return jsonify({"authed": False, "devices": []})
+    _active_device(sp_user)
     return jsonify(
         {
             "authed": True,
-            "device_id": DEVICE_ID,
-            "device_name": DEVICE_NAME,
-            "device_type": DEVICE_TYPE,
+            "active_device_name": ACTIVE_DEVICE_NAME,
             "devices": _device_debug_payload(sp_user),
             "ts": int(time.time()),
         }
