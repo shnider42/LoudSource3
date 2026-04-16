@@ -464,10 +464,24 @@ def _background_loop():
             now = time.time()
             in_cooldown = now < COOLDOWN_UNTIL
 
+            if DEBUG_VERBOSE == True:
+                log("\nDEBUG ----- now and time calculation ----- \n")
+                str_now = str(now)
+                str_in_cooldown = str(in_cooldown)
+                log(str_now)
+                log(str_in_cooldown)
+                log("\n----- DEBUG -----\n")
+
             # Periodic progress logging every 5 seconds while monitoring
             if now - LAST_PROGRESS_LOG_TS >= 5:
                 if DEBUG_VERBOSE == True:
-                    log("DEBUG --- 'if now - LAST_PROGRESS_LOG_TS >= 5' --- DEBUG")
+                    log("\nDEBUG --- 'if now - LAST_PROGRESS_LOG_TS >= 5' ---\n")
+                    try:
+                        time_trigger_math = now - LAST_PROGRESS_LOG_TS
+                        log(str(time_trigger_math))
+                    except:
+                        log("Failed to calculate time trigger math")
+                    log("\n----- DEBUG -----\n")
                 LAST_PROGRESS_LOG_TS = now
                 log(
                     f"Monitor: {snapshot['track_id']} "
@@ -505,7 +519,7 @@ def _background_loop():
 
             if _should_attempt_queue(snapshot):
                 if DEBUG_VERBOSE == True:
-                    log("DEBUG --- Background loop started --- DEBUG")
+                    log("DEBUG --- _should_attempt_queue(snapshot) --- DEBUG")
                 log(
                     f"Threshold reached: current={snapshot['uri']} "
                     f"remaining={snapshot['remaining_sec']}s "
