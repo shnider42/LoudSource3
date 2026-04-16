@@ -241,8 +241,8 @@ def _candidate_next_tid(current_uri):
 # ─── Playback snapshot helpers ─────────────────────────────────────────────────
 def _snapshot_from_current_playback(sp_user):
     try:
-        if DEBUG_VERBOSE == True:
-            log("DEBUG --- in the first try statement '_snapshot_from_current_playback(sp_user)' --- DEBUG")
+        #if DEBUG_VERBOSE == True:
+        #    log("DEBUG --- in the first try statement '_snapshot_from_current_playback(sp_user)' --- DEBUG")
         pb = sp_user.current_playback()
     except spotipy.SpotifyException as e:
         log(f"current_playback() failed: {e}")
@@ -526,6 +526,12 @@ def _background_loop():
                     f"next_candidate={_candidate_next_tid(snapshot['uri'])}"
                 )
                 _queue_next_for_snapshot(sp_user, snapshot)
+            else:
+                if DEBUG_VERBOSE == True:
+                    log("DEBUG --- _should_attempt_queue(snapshot) DID NOT RESOLVE --- DEBUG")
+                    log(str(_should_attempt_queue(snapshot)))
+                else:
+                    log("not attempting queue")
 
         except Exception as e:
             log(f"Background loop error: {e}")
