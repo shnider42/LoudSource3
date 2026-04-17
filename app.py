@@ -48,7 +48,6 @@ POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
 AUTO_RESUME = os.getenv("AUTO_RESUME", "true").lower() == "true"
 PAUSE_GRACE_SECONDS = int(os.getenv("PAUSE_GRACE_SECONDS", "6"))
 START_COOLDOWN_SECONDS = float(os.getenv("START_COOLDOWN_SECONDS", "2"))
-AUTO_ENABLE_ON_PLAYBACK = os.getenv("AUTO_ENABLE_ON_PLAYBACK", "true").lower() == "true"
 
 
 # ─── Flask ─────────────────────────────────────────────────────────────────────
@@ -387,65 +386,6 @@ def _should_attempt_queue(snapshot):
     return snapshot["remaining_ms"] <= (QUEUE_AHEAD_SECONDS * 1000)
 
 
-def _queue_gate_debug(snapshot, auto_enabled=None, in_cooldown=None):
-    if auto_enabled is None:
-        with STATE_LOCK:
-            auto_enabled = AUTO_ENABLED
-    if in_cooldown is None:
-        with STATE_LOCK:
-            in_cooldown = time.time() < COOLDOWN_UNTIL
-
-    next_candidate_tid = None
-    if snapshot and snapshot.get("uri"):
-        next_candidate_tid = _candidate_next_tid(snapshot["uri"])
-
-    debug = {
-        "auto_enabled": bool(auto_enabled),
-        "auto_enable_on_playback": bool(AUTO_ENABLE_ON_PLAYBACK),
-        "in_cooldown": bool(in_cooldown),
-        "has_snapshot": bool(snapshot),
-        "current_uri": snapshot.get("uri") if snapshot else None,
-        "current_track_id": snapshot.get("track_id") if snapshot else None,
-        "progress_sec": snapshot.get("progress_sec") if snapshot else None,
-        "duration_sec": snapshot.get("duration_sec") if snapshot else None,
-        "remaining_sec": snapshot.get("remaining_sec") if snapshot else None,
-        "is_playing": snapshot.get("is_playing") if snapshot else None,
-        "threshold_seconds": QUEUE_AHEAD_SECONDS,
-        "next_candidate_tid": next_candidate_tid,
-        "should_attempt_queue": False,
-        "reason": None,
-    }
-
-    if not auto_enabled:
-        debug["reason"] = "auto_disabled"
-        return debug
-    if not snapshot:
-        debug["reason"] = "no_snapshot"
-        return debug
-    if in_cooldown:
-        debug["reason"] = "cooldown"
-        return debug
-    if not snapshot.get("uri"):
-        debug["reason"] = "no_uri"
-        return debug
-    if snapshot.get("duration_ms", 0) <= 0:
-        debug["reason"] = "bad_duration"
-        return debug
-    if not snapshot.get("is_playing"):
-        debug["reason"] = "not_playing"
-        return debug
-    if snapshot.get("remaining_ms", 10**9) > (QUEUE_AHEAD_SECONDS * 1000):
-        debug["reason"] = "too_early"
-        return debug
-    if not next_candidate_tid:
-        debug["reason"] = "no_next_candidate"
-        return debug
-
-    debug["reason"] = "ready"
-    debug["should_attempt_queue"] = True
-    return debug
-
-
 def _queue_next_for_snapshot(sp_user, snapshot):
     global QUEUED_NEXT_FOR_URI, LAST_QUEUE_ATTEMPT_TS, COOLDOWN_UNTIL
 
@@ -538,13 +478,20 @@ def _state_snapshot():
 
 # ─── Background loop ───────────────────────────────────────────────────────────
 def _background_loop():
-    global LAST_PAUSED_TS, LAST_PROGRESS_LOG_TS, COOLDOWN_UNTIL, AUTO_ENABLED
+    global LAST_PAUSED_TS, LAST_PROGRESS_LOG_TS, COOLDOWN_UNTIL
 
     if DEBUG_VERBOSE:
         log("DEBUG --- Background loop started --- DEBUG")
 
     while True:
         try:
+            with STATE_LOCK:
+                auto_enabled = AUTO_ENABLED
+
+            if not auto_enabled:
+                time.sleep(POLL_SECONDS)
+                continue
+
             sp_user = _user_sp()
             if not sp_user:
                 time.sleep(POLL_SECONDS)
@@ -558,27 +505,13 @@ def _background_loop():
 
             if snapshot:
                 _update_now_playing_from_snapshot(sp_user, snapshot)
-                if AUTO_ENABLE_ON_PLAYBACK:
-                    with STATE_LOCK:
-                        if not AUTO_ENABLED and snapshot.get("uri"):
-                            AUTO_ENABLED = True
-                            log(
-                                "Auto-monitor enabled from live playback "
-                                f"({snapshot.get('uri')})"
-                            )
             else:
                 _active_device(sp_user)
-                with STATE_LOCK:
-                    auto_enabled = AUTO_ENABLED
-                if not auto_enabled:
-                    time.sleep(POLL_SECONDS)
-                    continue
                 time.sleep(POLL_SECONDS)
                 continue
 
             now = time.time()
             with STATE_LOCK:
-                auto_enabled = AUTO_ENABLED
                 in_cooldown = now < COOLDOWN_UNTIL
 
             if DEBUG_VERBOSE:
@@ -595,15 +528,12 @@ def _background_loop():
                 current_device_name = ACTIVE_DEVICE_NAME
 
             if should_log:
-                gate = _queue_gate_debug(snapshot, auto_enabled=auto_enabled, in_cooldown=in_cooldown)
                 log(
                     f"Monitor: {snapshot['track_id']} "
                     f"{snapshot['progress_sec']}/{snapshot['duration_sec']}s "
                     f"remaining={snapshot['remaining_sec']}s "
                     f"playing={snapshot['is_playing']} "
-                    f"device={current_device_name} "
-                    f"gate_reason={gate['reason']} "
-                    f"next_candidate={gate['next_candidate_tid']}"
+                    f"device={current_device_name}"
                 )
 
             with STATE_LOCK:
@@ -613,10 +543,6 @@ def _background_loop():
                 else:
                     LAST_PAUSED_TS = None
                 last_paused_ts = LAST_PAUSED_TS
-
-            if not auto_enabled:
-                time.sleep(POLL_SECONDS)
-                continue
 
             if in_cooldown:
                 time.sleep(POLL_SECONDS)
@@ -639,18 +565,17 @@ def _background_loop():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            gate = _queue_gate_debug(snapshot, auto_enabled=auto_enabled, in_cooldown=in_cooldown)
-            if gate["should_attempt_queue"]:
+            if _should_attempt_queue(snapshot):
                 log(
                     f"Threshold reached: current={snapshot['uri']} "
                     f"remaining={snapshot['remaining_sec']}s "
-                    f"next_candidate={gate['next_candidate_tid']}"
+                    f"next_candidate={_candidate_next_tid(snapshot['uri'])}"
                 )
                 _queue_next_for_snapshot(sp_user, snapshot)
             else:
                 if DEBUG_VERBOSE:
-                    log("DEBUG --- queue gate blocked --- DEBUG")
-                    log(str(gate))
+                    log("DEBUG --- _should_attempt_queue(snapshot) DID NOT RESOLVE --- DEBUG")
+                    log(str(_should_attempt_queue(snapshot)))
 
         except Exception as e:
             log(f"Background loop error: {e}")
@@ -695,7 +620,7 @@ TEMPLATE = """
     {% if authed %}
       <span class="muted">Logged in ✔</span>
       <a class="btn" href="{{ url_for('play_first') }}">▶️ Start with top track</a>
-      <span class="muted">Poll {{ poll_seconds }}s • Queue at {{ ahead }}s remaining • Auto {{ "ON" if auto_enabled else "OFF" }}</span>
+      <span class="muted">Poll {{ poll_seconds }}s • Queue at {{ ahead }}s remaining</span>
       {% if device_name %}
         <span class="muted">Active device: {{ device_name }}</span>
       {% endif %}
@@ -917,7 +842,6 @@ def index():
         tracks=tracks_snapshot,
         query=query,
         authed=bool(_get_token_info()),
-        auto_enabled=ss["auto_enabled"],
         ahead=QUEUE_AHEAD_SECONDS,
         poll_seconds=POLL_SECONDS,
         now_playing=now_playing,
@@ -1081,36 +1005,18 @@ def status_json():
         )
 
     next_candidate_tid = _candidate_next_tid(uri)
-    queue_debug = _queue_gate_debug(
-        {
-            "uri": uri,
-            "track_id": uri.split(":")[-1] if uri and uri.startswith("spotify:track:") else None,
-            "progress_sec": prog,
-            "duration_sec": dur,
-            "remaining_sec": max(0, dur - prog) if prog is not None and dur is not None else None,
-            "progress_ms": int(prog * 1000) if prog is not None else None,
-            "duration_ms": int(dur * 1000) if dur is not None else None,
-            "remaining_ms": int(max(0, dur - prog) * 1000) if prog is not None and dur is not None else None,
-            "is_playing": is_playing,
-        } if uri else None,
-        auto_enabled=ss["auto_enabled"],
-        in_cooldown=(time.time() < ss["cooldown_until"]),
-    )
-
     return jsonify(
         {
-            "version": "auto-enable-debug-drop-in",
+            "version": "thread-safe-ish-drop-in",
             "authed": bool(_get_token_info()),
             "ahead_seconds": QUEUE_AHEAD_SECONDS,
             "poll_seconds": POLL_SECONDS,
             "auto_enabled": ss["auto_enabled"],
-            "auto_enable_on_playback": AUTO_ENABLE_ON_PLAYBACK,
             "now_playing": np,
             "queue": queue_payload,
             "active_device_name": device_name,
             "queued_next_for_uri": queued_for,
             "next_candidate_tid": next_candidate_tid,
-            "queue_debug": queue_debug,
             "ts": int(time.time()),
         }
     )
@@ -1276,8 +1182,13 @@ if __name__ == "__main__":
     host = "0.0.0.0" if os.getenv("RENDER", "0") == "1" else "127.0.0.1"
     port = int(os.getenv("PORT", "5000"))
 
-    ssl_context = None
-    if os.getenv("RENDER", "0") != "1" and os.getenv("LOCAL_HTTPS", "0") == "1":
-        ssl_context = "adhoc"
+    if DEBUG_VERBOSE:
+        log("DEBUG --- main started correctly --- DEBUG")
 
-    app.run(host=host, port=port, debug=True, ssl_context=ssl_context)
+    if os.getenv("WEB_CONCURRENCY", "1") != "1":
+        log(
+            "WARNING: WEB_CONCURRENCY is not 1. This app stores queue/playback "
+            "state in memory and should run as a single worker."
+        )
+
+    app.run(host=host, port=port, debug=True)
