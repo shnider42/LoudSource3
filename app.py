@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # app.py — Spotify vote queue, Render-ready
 #
-# Drop-in version with safer threading/state handling:
-# - background thread is the only writer for CURRENT_* playback state
-# - /status.json is read-only
-# - votes/tracks/current state all protected by a single RLock
-# - avoids clearing CURRENT_URI on transient None snapshots near track boundaries
+# Active-device-only version:
+# - keeps the same web UI/routes
+# - removes explicit device_id targeting
+# - start/queue/resume all rely on Spotify's current active device
+# - simpler for sanity-checking whether Spotify queueing works at all
 
 from flask import (
     Flask,
@@ -22,6 +22,7 @@ import time
 import re
 import threading
 import requests
+import time
 from collections import defaultdict
 
 import spotipy
@@ -49,7 +50,6 @@ AUTO_RESUME = os.getenv("AUTO_RESUME", "true").lower() == "true"
 PAUSE_GRACE_SECONDS = int(os.getenv("PAUSE_GRACE_SECONDS", "6"))
 START_COOLDOWN_SECONDS = float(os.getenv("START_COOLDOWN_SECONDS", "2"))
 
-
 # ─── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-me")
@@ -61,7 +61,6 @@ if os.getenv("RENDER", "0") == "1":
         PREFERRED_URL_SCHEME="https",
     )
 
-
 # Search client (client credentials)
 sp_search = spotipy.Spotify(
     auth_manager=SpotifyClientCredentials(
@@ -70,7 +69,6 @@ sp_search = spotipy.Spotify(
     )
 )
 
-
 # ─── In-memory state ───────────────────────────────────────────────────────────
 votes = defaultdict(int)
 tracks = {}
@@ -78,8 +76,7 @@ tracks = {}
 TOKEN_INFO = None
 TOKEN_LOCK = threading.Lock()
 
-# One lock for all mutable app state touched by request threads + bg thread
-STATE_LOCK = threading.RLock()
+STATE_LOCK = threading.Lock()
 CURRENT_URI = None
 CURRENT_DURATION_SEC = None
 CURRENT_PROGRESS_SEC = None
@@ -179,8 +176,7 @@ def _active_device(sp_user):
     global ACTIVE_DEVICE_NAME
     devices = _list_devices(sp_user)
     active = next((d for d in devices if d.get("is_active")), None)
-    with STATE_LOCK:
-        ACTIVE_DEVICE_NAME = active.get("name") if active else None
+    ACTIVE_DEVICE_NAME = active.get("name") if active else None
     return active
 
 
@@ -217,23 +213,18 @@ def _track_dict_from_sp_item(t):
 
 
 def _ensure_track_cached_by_tid(tid, sp_user=None):
-    with STATE_LOCK:
-        if tid in tracks:
-            return
-
+    if tid in tracks:
+        return
     try:
         sp = sp_user or _user_sp() or sp_search
         info = sp.track(tid)
-        meta = _track_dict_from_sp_item(info)
-        with STATE_LOCK:
-            tracks.setdefault(tid, meta)
+        tracks[tid] = _track_dict_from_sp_item(info)
     except Exception as e:
         log(f"Failed to cache track {tid}: {e}")
 
 
 def _ordered_ids(exclude_tid=None):
-    with STATE_LOCK:
-        ordered = sorted(votes.items(), key=lambda x: x[1], reverse=True)
+    ordered = sorted(votes.items(), key=lambda x: x[1], reverse=True)
     return [tid for tid, cnt in ordered if cnt > 0 and tid != exclude_tid]
 
 
@@ -250,6 +241,8 @@ def _candidate_next_tid(current_uri):
 # ─── Playback snapshot helpers ─────────────────────────────────────────────────
 def _snapshot_from_current_playback(sp_user):
     try:
+        if DEBUG_VERBOSE == True:
+            log("DEBUG --- in the first try statement '_snapshot_from_current_playback(sp_user)' --- DEBUG")
         pb = sp_user.current_playback()
     except spotipy.SpotifyException as e:
         log(f"current_playback() failed: {e}")
@@ -260,8 +253,7 @@ def _snapshot_from_current_playback(sp_user):
 
     device = pb.get("device") or {}
     global ACTIVE_DEVICE_NAME
-    with STATE_LOCK:
-        ACTIVE_DEVICE_NAME = device.get("name") or ACTIVE_DEVICE_NAME
+    ACTIVE_DEVICE_NAME = device.get("name") or ACTIVE_DEVICE_NAME
 
     item = pb["item"]
     progress_ms = pb.get("progress_ms") or 0
@@ -324,57 +316,46 @@ def _update_now_playing_from_snapshot(sp_user, snapshot):
     global CURRENT_URI, CURRENT_DURATION_SEC, CURRENT_PROGRESS_SEC, CURRENT_IS_PLAYING
     global QUEUED_NEXT_FOR_URI, COOLDOWN_UNTIL
 
-    # Important: do NOT clear the current state on a transient None snapshot.
-    # Spotify can briefly report no item near track boundaries.
-    if not snapshot:
-        return False
-
-    uri = snapshot["uri"]
-    dur_sec = snapshot["duration_sec"]
-    prog_sec = snapshot["progress_sec"]
-    is_playing = snapshot["is_playing"]
+    uri = snapshot["uri"] if snapshot else None
+    dur_sec = snapshot["duration_sec"] if snapshot else None
+    prog_sec = snapshot["progress_sec"] if snapshot else None
+    is_playing = snapshot["is_playing"] if snapshot else None
 
     now = time.time()
     changed = False
-    popped_tid = None
 
     with STATE_LOCK:
         if uri != CURRENT_URI:
             changed = True
+            if uri:
+                log(
+                    f"Now playing → {uri} "
+                    f"({prog_sec}/{dur_sec}s via {snapshot['source']})"
+                )
+            else:
+                log("Now playing → nothing")
             CURRENT_URI = uri
             CURRENT_DURATION_SEC = dur_sec if uri else None
             CURRENT_PROGRESS_SEC = prog_sec if uri else None
             CURRENT_IS_PLAYING = is_playing
             QUEUED_NEXT_FOR_URI = None
             COOLDOWN_UNTIL = now + START_COOLDOWN_SECONDS
-
-            if uri and uri.startswith("spotify:track:"):
-                popped_tid = uri.split(":")[-1]
-                votes.pop(popped_tid, None)
         else:
             CURRENT_DURATION_SEC = dur_sec if uri else None
             CURRENT_PROGRESS_SEC = prog_sec if uri else None
             CURRENT_IS_PLAYING = is_playing
 
     if uri and uri.startswith("spotify:track:"):
-        _ensure_track_cached_by_tid(uri.split(":")[-1], sp_user=sp_user)
-
-    if changed:
-        if uri:
-            log(
-                f"Now playing → {uri} "
-                f"({prog_sec}/{dur_sec}s via {snapshot['source']})"
-            )
-        else:
-            log("Now playing → nothing")
-        if popped_tid:
-            log(f"Removed current track from vote queue: {popped_tid}")
+        tid = uri.split(":")[-1]
+        _ensure_track_cached_by_tid(tid, sp_user=sp_user)
+        if changed:
+            votes.pop(tid, None)
 
     return changed
 
 
 def _should_attempt_queue(snapshot):
-    if DEBUG_VERBOSE:
+    if DEBUG_VERBOSE == True:
         log("DEBUG --- inside _should_attempt_queue() --- DEBUG")
 
     if not snapshot:
@@ -394,6 +375,8 @@ def _queue_next_for_snapshot(sp_user, snapshot):
         log("Queue skip: no next candidate from votes")
         return False, "no_next_candidate"
 
+    #next_uri = f"spotify:track:{next_tid}"
+
     if not _is_valid_track_id(next_tid):
         log(f"Bad next_tid: {next_tid!r}")
         return False, "bad_track_id"
@@ -402,19 +385,9 @@ def _queue_next_for_snapshot(sp_user, snapshot):
     log(f"Queueing URI: {next_uri}")
 
     with STATE_LOCK:
-        current_uri = CURRENT_URI
-        already_queued_for = QUEUED_NEXT_FOR_URI
-
-    if current_uri != snapshot["uri"]:
-        log(
-            f"Queue skip: current changed before queue attempt "
-            f"snapshot={snapshot['uri']} current={current_uri}"
-        )
-        return False, "current_changed"
-
-    if already_queued_for == snapshot["uri"]:
-        log(f"Queue skip: already queued for current song {snapshot['uri']}")
-        return False, "already_queued_for_current_song"
+        if QUEUED_NEXT_FOR_URI == snapshot["uri"]:
+            log(f"Queue skip: already queued for current song {snapshot['uri']}")
+            return False, "already_queued_for_current_song"
 
     ti = _get_token_info()
     if not ti:
@@ -422,16 +395,6 @@ def _queue_next_for_snapshot(sp_user, snapshot):
         return False, "missing_token"
 
     headers = {"Authorization": f"Bearer {ti['access_token']}"}
-
-    if DEBUG_VERBOSE == True:
-        log(
-            "DBG queue attempt precheck "
-            f"snapshot_uri={snapshot['uri']} "
-            f"next_tid={next_tid} "
-            f"next_uri={next_uri} "
-            f"current_uri={current_uri} "
-            f"already_queued_for={already_queued_for}"
-        )
 
     try:
         LAST_QUEUE_ATTEMPT_TS = time.time()
@@ -450,22 +413,12 @@ def _queue_next_for_snapshot(sp_user, snapshot):
             f"status={resp.status_code} body={resp.text!r}"
         )
 
+        # Your sanity route proved that 200 can still functionally queue.
         if resp.status_code in (200, 204):
             with STATE_LOCK:
-                # Only mark success if we are still on the same song.
-                if CURRENT_URI == snapshot["uri"]:
-                    QUEUED_NEXT_FOR_URI = snapshot["uri"]
-                    COOLDOWN_UNTIL = time.time() + 1.0
+                QUEUED_NEXT_FOR_URI = snapshot["uri"]
+                COOLDOWN_UNTIL = time.time() + 1.0
             log(f"Queued next successfully: {next_uri}")
-
-            if DEBUG_VERBOSE == True:
-                log(
-                    "DBG queue response "
-                    f"status={resp.status_code} "
-                    f"body={resp.text!r} "
-                    f"queued_for_song={snapshot['uri']}"
-                )
-
             return True, next_uri
 
         return False, f"status={resp.status_code} body={resp.text}"
@@ -474,40 +427,19 @@ def _queue_next_for_snapshot(sp_user, snapshot):
         log(f"Queue request exception for {next_uri}: {e}")
         return False, str(e)
 
-
 def _is_valid_track_id(tid):
     return isinstance(tid, str) and re.fullmatch(r"[A-Za-z0-9]{22}", tid) is not None
-
-
-def _state_snapshot():
-    with STATE_LOCK:
-        return {
-            "current_uri": CURRENT_URI,
-            "current_duration_sec": CURRENT_DURATION_SEC,
-            "current_progress_sec": CURRENT_PROGRESS_SEC,
-            "current_is_playing": CURRENT_IS_PLAYING,
-            "active_device_name": ACTIVE_DEVICE_NAME,
-            "queued_next_for_uri": QUEUED_NEXT_FOR_URI,
-            "auto_enabled": AUTO_ENABLED,
-            "cooldown_until": COOLDOWN_UNTIL,
-            "votes_items": list(votes.items()),
-            "tracks_copy": dict(tracks),
-        }
-
 
 # ─── Background loop ───────────────────────────────────────────────────────────
 def _background_loop():
     global LAST_PAUSED_TS, LAST_PROGRESS_LOG_TS, COOLDOWN_UNTIL
 
-    if DEBUG_VERBOSE:
+    if DEBUG_VERBOSE == True:
         log("DEBUG --- Background loop started --- DEBUG")
 
     while True:
         try:
-            with STATE_LOCK:
-                auto_enabled = AUTO_ENABLED
-
-            if not auto_enabled:
+            if not AUTO_ENABLED:
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -517,71 +449,53 @@ def _background_loop():
                 continue
 
             snapshot = _playback_snapshot(sp_user)
-            if DEBUG_VERBOSE:
-                log("\nDEBUG ----- SNAPSHOT -----\n")
-                log(str(snapshot))
+            if DEBUG_VERBOSE == True:
+                log("\nDEBUG ----- SNAPSHOT ----- \n")
+                str_snapshot = str(snapshot)
+                log(str_snapshot)
                 log("\n----- DEBUG -----\n")
+            _update_now_playing_from_snapshot(sp_user, snapshot)
 
-            if snapshot:
-                _update_now_playing_from_snapshot(sp_user, snapshot)
-            else:
+            if not snapshot:
                 _active_device(sp_user)
                 time.sleep(POLL_SECONDS)
                 continue
 
             now = time.time()
-            with STATE_LOCK:
-                in_cooldown = now < COOLDOWN_UNTIL
-
-            next_tid = _candidate_next_tid(snapshot["uri"]) if snapshot else None
-            should_queue = _should_attempt_queue(snapshot) if snapshot else False
+            in_cooldown = now < COOLDOWN_UNTIL
 
             if DEBUG_VERBOSE == True:
-                log(
-                    "DBG "
-                    f"auto={auto_enabled} "
-                    f"snapshot_exists={snapshot is not None} "
-                    f"uri={snapshot['uri'] if snapshot else None} "
-                    f"playing={snapshot['is_playing'] if snapshot else None} "
-                    f"prog_ms={snapshot['progress_ms'] if snapshot else None} "
-                    f"dur_ms={snapshot['duration_ms'] if snapshot else None} "
-                    f"remaining_ms={snapshot['remaining_ms'] if snapshot else None} "
-                    f"remaining_sec={snapshot['remaining_sec'] if snapshot else None} "
-                    f"threshold_ms={QUEUE_AHEAD_SECONDS * 1000} "
-                    f"should_queue={should_queue} "
-                    f"in_cooldown={in_cooldown} "
-                    f"next_tid={next_tid}"
-                )
-
-            if DEBUG_VERBOSE:
-                log("\nDEBUG ----- now and time calculation -----\n")
-                log(str(now))
-                log(str(in_cooldown))
+                log("\nDEBUG ----- now and time calculation ----- \n")
+                str_now = str(now)
+                str_in_cooldown = str(in_cooldown)
+                log(str_now)
+                log(str_in_cooldown)
                 log("\n----- DEBUG -----\n")
 
-            should_log = False
-            with STATE_LOCK:
-                if now - LAST_PROGRESS_LOG_TS >= 5:
-                    LAST_PROGRESS_LOG_TS = now
-                    should_log = True
-                current_device_name = ACTIVE_DEVICE_NAME
-
-            if should_log:
+            # Periodic progress logging every 5 seconds while monitoring
+            if now - LAST_PROGRESS_LOG_TS >= 5:
+                if DEBUG_VERBOSE == True:
+                    log("\nDEBUG --- 'if now - LAST_PROGRESS_LOG_TS >= 5' ---\n")
+                    try:
+                        time_trigger_math = now - LAST_PROGRESS_LOG_TS
+                        log(str(time_trigger_math))
+                    except:
+                        log("Failed to calculate time trigger math")
+                    log("\n----- DEBUG -----\n")
+                LAST_PROGRESS_LOG_TS = now
                 log(
                     f"Monitor: {snapshot['track_id']} "
                     f"{snapshot['progress_sec']}/{snapshot['duration_sec']}s "
                     f"remaining={snapshot['remaining_sec']}s "
                     f"playing={snapshot['is_playing']} "
-                    f"device={current_device_name}"
+                    f"device={ACTIVE_DEVICE_NAME}"
                 )
 
-            with STATE_LOCK:
-                if not snapshot["is_playing"]:
-                    if LAST_PAUSED_TS is None:
-                        LAST_PAUSED_TS = now
-                else:
-                    LAST_PAUSED_TS = None
-                last_paused_ts = LAST_PAUSED_TS
+            if not snapshot["is_playing"]:
+                if LAST_PAUSED_TS is None:
+                    LAST_PAUSED_TS = now
+            else:
+                LAST_PAUSED_TS = None
 
             if in_cooldown:
                 time.sleep(POLL_SECONDS)
@@ -590,31 +504,28 @@ def _background_loop():
             if (
                 AUTO_RESUME
                 and not snapshot["is_playing"]
-                and last_paused_ts
-                and (now - last_paused_ts) >= PAUSE_GRACE_SECONDS
+                and LAST_PAUSED_TS
+                and (now - LAST_PAUSED_TS) >= PAUSE_GRACE_SECONDS
             ):
                 try:
                     sp_user.start_playback()
+                    log(f"Auto-resume on active device ({ACTIVE_DEVICE_NAME})")
                     with STATE_LOCK:
-                        current_device_name = ACTIVE_DEVICE_NAME
                         COOLDOWN_UNTIL = time.time() + 1.0
-                    log(f"Auto-resume on active device ({current_device_name})")
                 except spotipy.SpotifyException as e:
                     log(f"Auto-resume failed on active device: {e}")
                 time.sleep(POLL_SECONDS)
                 continue
 
             if _should_attempt_queue(snapshot):
+                if DEBUG_VERBOSE == True:
+                    log("DEBUG --- _should_attempt_queue(snapshot) --- DEBUG")
                 log(
                     f"Threshold reached: current={snapshot['uri']} "
                     f"remaining={snapshot['remaining_sec']}s "
                     f"next_candidate={_candidate_next_tid(snapshot['uri'])}"
                 )
                 _queue_next_for_snapshot(sp_user, snapshot)
-            else:
-                if DEBUG_VERBOSE:
-                    log("DEBUG --- _should_attempt_queue(snapshot) DID NOT RESOLVE --- DEBUG")
-                    log(str(_should_attempt_queue(snapshot)))
 
         except Exception as e:
             log(f"Background loop error: {e}")
@@ -655,7 +566,7 @@ TEMPLATE = """
 </head>
 <body>
   <div class="topbar">
-    <h1>Spotify Vote Queue <span class="muted" style="font-size:0.8rem;">thread-safe-ish drop-in</span></h1>
+    <h1>Spotify Vote Queue <span class="muted" style="font-size:0.8rem;">active-device-only</span></h1>
     {% if authed %}
       <span class="muted">Logged in ✔</span>
       <a class="btn" href="{{ url_for('play_first') }}">▶️ Start with top track</a>
@@ -814,7 +725,7 @@ TEMPLATE = """
 # ─── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
-    if DEBUG_VERBOSE:
+    if DEBUG_VERBOSE == True:
         log("DEBUG --- index() started --- DEBUG")
     _start_background_thread_once()
 
@@ -830,21 +741,18 @@ def index():
             items = sp_search.search(q=query, type="track", limit=10)["tracks"]["items"]
             for t in items:
                 tid = t["id"]
-                meta = _track_dict_from_sp_item(t)
-                with STATE_LOCK:
-                    tracks.setdefault(tid, meta)
-                    results[tid] = tracks[tid]
+                if tid not in tracks:
+                    tracks[tid] = _track_dict_from_sp_item(t)
+                results[tid] = tracks[tid]
+                votes[tid] = votes.get(tid, 0)
         except Exception as e:
             log(f"Search failed for query={query!r}: {e}")
 
-    ss = _state_snapshot()
-    np_uri = ss["current_uri"]
-    dur = ss["current_duration_sec"]
-    prog = ss["current_progress_sec"]
-    is_playing = ss["current_is_playing"]
-    device_name = ss["active_device_name"]
-    tracks_snapshot = ss["tracks_copy"]
-    votes_items = ss["votes_items"]
+    with STATE_LOCK:
+        np_uri = CURRENT_URI
+        dur = CURRENT_DURATION_SEC
+        prog = CURRENT_PROGRESS_SEC
+        is_playing = CURRENT_IS_PLAYING
 
     np_tid = (
         np_uri.split(":")[-1]
@@ -854,15 +762,14 @@ def index():
 
     queue = [
         (tid, c)
-        for tid, c in sorted(votes_items, key=lambda x: x[1], reverse=True)
+        for tid, c in sorted(votes.items(), key=lambda x: x[1], reverse=True)
         if c > 0 and tid != np_tid
     ]
 
     now_playing = None
     if np_tid:
         _ensure_track_cached_by_tid(np_tid)
-        tracks_snapshot = _state_snapshot()["tracks_copy"]
-        meta = tracks_snapshot.get(np_tid)
+        meta = tracks.get(np_tid)
         if meta:
             extra_bits = []
             if dur is not None:
@@ -878,13 +785,13 @@ def index():
         TEMPLATE,
         results=results,
         queue=queue,
-        tracks=tracks_snapshot,
+        tracks=tracks,
         query=query,
         authed=bool(_get_token_info()),
         ahead=QUEUE_AHEAD_SECONDS,
         poll_seconds=POLL_SECONDS,
         now_playing=now_playing,
-        device_name=device_name,
+        device_name=ACTIVE_DEVICE_NAME,
     )
 
 
@@ -892,8 +799,7 @@ def index():
 def vote():
     tid = request.form.get("track_id")
     if tid:
-        with STATE_LOCK:
-            votes[tid] = votes.get(tid, 0) + 1
+        votes[tid] = votes.get(tid, 0) + 1
     return redirect(url_for("index"))
 
 
@@ -901,15 +807,13 @@ def vote():
 def downvote():
     tid = request.form.get("track_id")
     if tid:
-        with STATE_LOCK:
-            votes[tid] = max(0, votes.get(tid, 0) - 1)
+        votes[tid] = max(0, votes.get(tid, 0) - 1)
     return redirect(url_for("index"))
 
 
 @app.route("/clear", methods=["POST"])
 def clear():
-    with STATE_LOCK:
-        votes.clear()
+    votes.clear()
     return redirect(url_for("index"))
 
 
@@ -953,52 +857,50 @@ def play_first():
 
     try:
         sp_user.start_playback(uris=[top_uri])
-        current_device_name = _state_snapshot()["active_device_name"]
-        log(f"Start with top track on active device ({current_device_name}) → {top_uri}")
+        log(f"Start with top track on active device ({ACTIVE_DEVICE_NAME}) → {top_uri}")
     except spotipy.SpotifyException as e:
         return f"Failed to start on active device: {e}", 400
 
-    with STATE_LOCK:
-        votes.pop(top_id, None)
-
+    votes.pop(top_id, None)
     time.sleep(0.7)
 
     snapshot = _playback_snapshot(sp_user)
-    if snapshot:
-        _update_now_playing_from_snapshot(sp_user, snapshot)
+    _update_now_playing_from_snapshot(sp_user, snapshot)
 
     with STATE_LOCK:
         COOLDOWN_UNTIL = time.time() + START_COOLDOWN_SECONDS
         QUEUED_NEXT_FOR_URI = None
-        AUTO_ENABLED = True
+        log(f"STATE_LOCK END OF WITH STATEMENT")
 
+    AUTO_ENABLED = True
     return redirect(url_for("index"))
 
 
 @app.route("/status.json")
 def status_json():
     sp_user = _user_sp()
+    snapshot = None
+
     if sp_user:
         try:
+            snapshot = _playback_snapshot(sp_user)
+            _update_now_playing_from_snapshot(sp_user, snapshot)
             _active_device(sp_user)
         except Exception as e:
-            log(f"status.json device refresh failed: {e}")
+            log(f"status.json snapshot failed: {e}")
 
-    ss = _state_snapshot()
-    uri = ss["current_uri"]
-    dur = ss["current_duration_sec"]
-    prog = ss["current_progress_sec"]
-    is_playing = ss["current_is_playing"]
-    queued_for = ss["queued_next_for_uri"]
-    tracks_snapshot = ss["tracks_copy"]
-    device_name = ss["active_device_name"]
+    with STATE_LOCK:
+        uri = CURRENT_URI
+        dur = CURRENT_DURATION_SEC
+        prog = CURRENT_PROGRESS_SEC
+        is_playing = CURRENT_IS_PLAYING
+        queued_for = QUEUED_NEXT_FOR_URI
 
     np = None
     if uri and uri.startswith("spotify:track:"):
         tid = uri.split(":")[-1]
         _ensure_track_cached_by_tid(tid, sp_user=sp_user)
-        tracks_snapshot = _state_snapshot()["tracks_copy"]
-        meta = tracks_snapshot.get(tid)
+        meta = tracks.get(tid)
         if meta:
             extra_bits = []
             if dur is not None:
@@ -1022,19 +924,14 @@ def status_json():
     )
     ids = _ordered_ids(exclude_tid=exclude_tid)
 
-    for tid in ids:
-        _ensure_track_cached_by_tid(tid, sp_user=sp_user)
-
-    ss = _state_snapshot()
-    tracks_snapshot = ss["tracks_copy"]
-
     queue_payload = []
     for tid in ids:
-        meta = tracks_snapshot.get(tid, {})
+        _ensure_track_cached_by_tid(tid, sp_user=sp_user)
+        meta = tracks.get(tid, {})
         queue_payload.append(
             {
                 "track_id": tid,
-                "votes": int(dict(ss["votes_items"]).get(tid, 0)),
+                "votes": int(votes.get(tid, 0)),
                 "track": {
                     "name": meta.get("name"),
                     "artist": meta.get("artist"),
@@ -1046,14 +943,14 @@ def status_json():
     next_candidate_tid = _candidate_next_tid(uri)
     return jsonify(
         {
-            "version": "thread-safe-ish-drop-in",
+            "version": "active-device-only",
             "authed": bool(_get_token_info()),
             "ahead_seconds": QUEUE_AHEAD_SECONDS,
             "poll_seconds": POLL_SECONDS,
-            "auto_enabled": ss["auto_enabled"],
+            "auto_enabled": AUTO_ENABLED,
             "now_playing": np,
             "queue": queue_payload,
-            "active_device_name": device_name,
+            "active_device_name": ACTIVE_DEVICE_NAME,
             "queued_next_for_uri": queued_for,
             "next_candidate_tid": next_candidate_tid,
             "ts": int(time.time()),
@@ -1070,7 +967,7 @@ def devices_json():
     return jsonify(
         {
             "authed": True,
-            "active_device_name": _state_snapshot()["active_device_name"],
+            "active_device_name": ACTIVE_DEVICE_NAME,
             "devices": _device_debug_payload(sp_user),
             "ts": int(time.time()),
         }
@@ -1128,13 +1025,12 @@ def queue_sanity():
         )
         result["queue_status"] = queue_resp.status_code
         result["queue_text"] = queue_resp.text
-        result["queue_ok"] = queue_resp.status_code in (200, 204)
+        result["queue_ok"] = queue_resp.status_code == 204
     except Exception as e:
         result["queue_error"] = str(e)
         result["queue_ok"] = False
 
     return jsonify(result)
-
 
 @app.route("/queue_sanity2")
 def queue_sanity2():
@@ -1150,6 +1046,7 @@ def queue_sanity2():
         "authed": True,
     }
 
+    # Active devices
     devices_resp = requests.get(
         "https://api.spotify.com/v1/me/player/devices",
         headers=headers,
@@ -1162,6 +1059,7 @@ def queue_sanity2():
     except Exception:
         result["devices_text"] = devices_resp.text
 
+    # Current playback
     playback_resp = requests.get(
         "https://api.spotify.com/v1/me/player",
         headers=headers,
@@ -1174,6 +1072,7 @@ def queue_sanity2():
     except Exception:
         result["playback_text"] = playback_resp.text
 
+    # POST to queue
     queue_post = requests.post(
         "https://api.spotify.com/v1/me/player/queue",
         headers=headers,
@@ -1186,6 +1085,7 @@ def queue_sanity2():
     result["queue_post_headers"] = dict(queue_post.headers)
     result["queue_post_text"] = queue_post.text
 
+    # Give Spotify a moment, then read queue back
     time.sleep(1.0)
 
     queue_get = requests.get(
@@ -1213,15 +1113,21 @@ def queue_sanity2():
 
     return jsonify(result)
 
-
 # ─── Startup ───────────────────────────────────────────────────────────────────
+#if DEBUG_VERBOSE == True:
+#    log("DEBUG --- starting index() INSTEAD OF DEFAULT, THIS FLAG NEEDS TO BE WATCHED --- DEBUG")
+#    index()
+#else:
+#    log("DEBUG --- normal non debug behavior --- DEBUG")
+#    _start_background_thread_once()
+
 _start_background_thread_once()
 
 if __name__ == "__main__":
     host = "0.0.0.0" if os.getenv("RENDER", "0") == "1" else "127.0.0.1"
     port = int(os.getenv("PORT", "5000"))
 
-    if DEBUG_VERBOSE:
+    if DEBUG_VERBOSE == True:
         log("DEBUG --- main started correctly --- DEBUG")
 
     if os.getenv("WEB_CONCURRENCY", "1") != "1":
