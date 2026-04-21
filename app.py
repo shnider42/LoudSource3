@@ -390,6 +390,55 @@ def _update_now_playing_from_snapshot(sp_user, snapshot):
     return changed
 
 
+def _ui_playback_view(sp_user):
+    """
+    Read-only view of playback for the UI.
+
+    Preference order:
+    1) If automation is active and CURRENT_* exists, use shared state.
+    2) Otherwise, fall back to a live Spotify snapshot for display only.
+       This does NOT mutate CURRENT_* state.
+    """
+    ss = _state_snapshot()
+
+    state_uri = ss["current_uri"]
+    state_dur = ss["current_duration_sec"]
+    state_prog = ss["current_progress_sec"]
+    state_is_playing = ss["current_is_playing"]
+    auto_enabled = ss["auto_enabled"]
+
+    # When automation is armed and we have state, trust the background loop.
+    if auto_enabled and state_uri:
+        return {
+            "uri": state_uri,
+            "duration_sec": state_dur,
+            "progress_sec": state_prog,
+            "is_playing": state_is_playing,
+            "source": "state",
+        }
+
+    # Otherwise, read live from Spotify for display only.
+    if sp_user:
+        live = _playback_snapshot(sp_user)
+        if live:
+            return {
+                "uri": live["uri"],
+                "duration_sec": live["duration_sec"],
+                "progress_sec": live["progress_sec"],
+                "is_playing": live["is_playing"],
+                "source": "live",
+            }
+
+    # Last fallback: whatever state we have, even if automation is off.
+    return {
+        "uri": state_uri,
+        "duration_sec": state_dur,
+        "progress_sec": state_prog,
+        "is_playing": state_is_playing,
+        "source": "state_fallback",
+    }
+
+
 def _should_attempt_queue(snapshot):
     if not snapshot:
         return False
@@ -792,11 +841,14 @@ def index():
         except Exception as e:
             log(f"Search failed for query={query!r}: {e}")
 
+    ui_pb = _ui_playback_view(sp_user)
     ss = _state_snapshot()
-    np_uri = ss["current_uri"]
-    dur = ss["current_duration_sec"]
-    prog = ss["current_progress_sec"]
-    is_playing = ss["current_is_playing"]
+
+    np_uri = ui_pb["uri"]
+    dur = ui_pb["duration_sec"]
+    prog = ui_pb["progress_sec"]
+    is_playing = ui_pb["is_playing"]
+
     device_name = ss["active_device_name"]
     tracks_snapshot = ss["tracks_copy"]
     votes_items = ss["votes_items"]
@@ -940,14 +992,17 @@ def status_json():
         except Exception as e:
             log(f"status.json device refresh failed: {e}")
 
+    ui_pb = _ui_playback_view(sp_user)
     ss = _state_snapshot()
-    uri = ss["current_uri"]
-    dur = ss["current_duration_sec"]
-    prog = ss["current_progress_sec"]
-    is_playing = ss["current_is_playing"]
+
+    uri = ui_pb["uri"]
+    dur = ui_pb["duration_sec"]
+    prog = ui_pb["progress_sec"]
+    is_playing = ui_pb["is_playing"]
+
     queued_for = ss["queued_next_for_uri"]
-    tracks_snapshot = ss["tracks_copy"]
     device_name = ss["active_device_name"]
+    tracks_snapshot = ss["tracks_copy"]
 
     np = None
     if uri and uri.startswith("spotify:track:"):
@@ -1002,7 +1057,7 @@ def status_json():
     next_candidate_tid = _candidate_next_tid(uri)
     return jsonify(
         {
-            "version": "drop-in-debug-stability",
+            "version": "drop-in-debug-stability-uifix1",
             "authed": bool(_get_token_info()),
             "ahead_seconds": QUEUE_AHEAD_SECONDS,
             "poll_seconds": POLL_SECONDS,
@@ -1013,6 +1068,7 @@ def status_json():
             "queued_next_for_uri": queued_for,
             "next_candidate_tid": next_candidate_tid,
             "ts": int(time.time()),
+            "ui_source": ui_pb["source"],
         }
     )
 
