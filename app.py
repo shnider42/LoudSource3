@@ -100,6 +100,10 @@ LAST_PAUSED_TS = None
 BG_THREAD_STARTED = False
 BG_THREAD_LOCK = threading.Lock()
 
+BOOT_TS = int(time.time())
+BOOT_ID = f"{BOOT_TS}-{os.getpid()}"
+AUTO_ENABLED_SET_TS = None
+
 
 def log(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
@@ -390,6 +394,7 @@ def _update_now_playing_from_snapshot(sp_user, snapshot):
     return changed
 
 
+
 def _ui_playback_view(sp_user):
     """
     Read-only view of playback for the UI.
@@ -407,7 +412,6 @@ def _ui_playback_view(sp_user):
     state_is_playing = ss["current_is_playing"]
     auto_enabled = ss["auto_enabled"]
 
-    # When automation is armed and we have state, trust the background loop.
     if auto_enabled and state_uri:
         return {
             "uri": state_uri,
@@ -417,7 +421,6 @@ def _ui_playback_view(sp_user):
             "source": "state",
         }
 
-    # Otherwise, read live from Spotify for display only.
     if sp_user:
         live = _playback_snapshot(sp_user)
         if live:
@@ -429,7 +432,6 @@ def _ui_playback_view(sp_user):
                 "source": "live",
             }
 
-    # Last fallback: whatever state we have, even if automation is off.
     return {
         "uri": state_uri,
         "duration_sec": state_dur,
@@ -894,7 +896,6 @@ def index():
         device_name=device_name,
     )
 
-
 @app.route("/vote", methods=["POST"])
 def vote():
     tid = request.form.get("track_id")
@@ -938,7 +939,7 @@ def callback():
 
 @app.route("/play_first")
 def play_first():
-    global AUTO_ENABLED, COOLDOWN_UNTIL, QUEUED_NEXT_FOR_URI
+    global AUTO_ENABLED, COOLDOWN_UNTIL, QUEUED_NEXT_FOR_URI, AUTO_ENABLED_SET_TS
 
     ids = _ordered_ids()
     if not ids:
@@ -978,10 +979,14 @@ def play_first():
         COOLDOWN_UNTIL = time.time() + START_COOLDOWN_SECONDS
         QUEUED_NEXT_FOR_URI = None
         AUTO_ENABLED = True
+        AUTO_ENABLED_SET_TS = int(time.time())
 
-    log("Automation armed: AUTO_ENABLED=True")
+    log(
+        f"Automation armed: AUTO_ENABLED=True "
+        f"boot_id={BOOT_ID} pid={os.getpid()} "
+        f"set_ts={AUTO_ENABLED_SET_TS}"
+    )
     return redirect(url_for("index"))
-
 
 @app.route("/status.json")
 def status_json():
@@ -1057,7 +1062,7 @@ def status_json():
     next_candidate_tid = _candidate_next_tid(uri)
     return jsonify(
         {
-            "version": "drop-in-debug-stability-uifix1",
+            "version": "drop-in-debug-stability-uifix2",
             "authed": bool(_get_token_info()),
             "ahead_seconds": QUEUE_AHEAD_SECONDS,
             "poll_seconds": POLL_SECONDS,
@@ -1069,9 +1074,13 @@ def status_json():
             "next_candidate_tid": next_candidate_tid,
             "ts": int(time.time()),
             "ui_source": ui_pb["source"],
+            "boot_id": BOOT_ID,
+            "pid": os.getpid(),
+            "boot_ts": BOOT_TS,
+            "uptime_sec": int(time.time()) - BOOT_TS,
+            "auto_enabled_set_ts": AUTO_ENABLED_SET_TS,
         }
     )
-
 
 @app.route("/devices.json")
 def devices_json():
@@ -1228,6 +1237,7 @@ def queue_sanity2():
 
 # ─── Startup ───────────────────────────────────────────────────────────────────
 _start_background_thread_once()
+log(f"Service booted: boot_id={BOOT_ID} pid={os.getpid()}")
 
 if __name__ == "__main__":
     host = "0.0.0.0" if os.getenv("RENDER", "0") == "1" else "127.0.0.1"
