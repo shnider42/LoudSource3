@@ -423,6 +423,16 @@ def _queue_next_for_snapshot(sp_user, snapshot):
 
     headers = {"Authorization": f"Bearer {ti['access_token']}"}
 
+    if DEBUG_VERBOSE == True:
+        log(
+            "DBG queue attempt precheck "
+            f"snapshot_uri={snapshot['uri']} "
+            f"next_tid={next_tid} "
+            f"next_uri={next_uri} "
+            f"current_uri={current_uri} "
+            f"already_queued_for={already_queued_for}"
+        )
+
     try:
         LAST_QUEUE_ATTEMPT_TS = time.time()
 
@@ -447,6 +457,15 @@ def _queue_next_for_snapshot(sp_user, snapshot):
                     QUEUED_NEXT_FOR_URI = snapshot["uri"]
                     COOLDOWN_UNTIL = time.time() + 1.0
             log(f"Queued next successfully: {next_uri}")
+
+            if DEBUG_VERBOSE == True:
+                log(
+                    "DBG queue response "
+                    f"status={resp.status_code} "
+                    f"body={resp.text!r} "
+                    f"queued_for_song={snapshot['uri']}"
+                )
+
             return True, next_uri
 
         return False, f"status={resp.status_code} body={resp.text}"
@@ -513,6 +532,26 @@ def _background_loop():
             now = time.time()
             with STATE_LOCK:
                 in_cooldown = now < COOLDOWN_UNTIL
+
+            next_tid = _candidate_next_tid(snapshot["uri"]) if snapshot else None
+            should_queue = _should_attempt_queue(snapshot) if snapshot else False
+
+            if DEBUG_VERBOSE == True:
+                log(
+                    "DBG "
+                    f"auto={auto_enabled} "
+                    f"snapshot_exists={snapshot is not None} "
+                    f"uri={snapshot['uri'] if snapshot else None} "
+                    f"playing={snapshot['is_playing'] if snapshot else None} "
+                    f"prog_ms={snapshot['progress_ms'] if snapshot else None} "
+                    f"dur_ms={snapshot['duration_ms'] if snapshot else None} "
+                    f"remaining_ms={snapshot['remaining_ms'] if snapshot else None} "
+                    f"remaining_sec={snapshot['remaining_sec'] if snapshot else None} "
+                    f"threshold_ms={QUEUE_AHEAD_SECONDS * 1000} "
+                    f"should_queue={should_queue} "
+                    f"in_cooldown={in_cooldown} "
+                    f"next_tid={next_tid}"
+                )
 
             if DEBUG_VERBOSE:
                 log("\nDEBUG ----- now and time calculation -----\n")
